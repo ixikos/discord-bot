@@ -1,4 +1,12 @@
 require('dotenv').config();
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled Rejection:', err);
+});
+
 console.log('TOKEN EXISTS:', !!process.env.DISCORD_TOKEN);
 
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
