@@ -32,6 +32,7 @@ client.on('interactionCreate', async (interaction) => {
 
 // Message events (bug channel monitoring)
 client.on('messageCreate', async (message) => {
+  console.log(`Message received in channel: ${message.channelId} | BUGS_CHANNEL_ID: ${process.env.BUGS_CHANNEL_ID}`);
   await messageHandler.handle(message, client);
 });
 
