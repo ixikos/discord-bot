@@ -40,6 +40,9 @@ client.login(process.env.DISCORD_TOKEN);
 
 // Express server — receives webhooks from build machine / n8n
 const app = express();
+
+app.get('/health', (req, res) => res.json({ ok: true }));
+
 app.use(express.json());
 
 app.post('/webhook/:type', async (req, res) => {
