@@ -1,3 +1,5 @@
+console.log('TOKEN EXISTS:', !!process.env.DISCORD_TOKEN);
+
 require('dotenv').config();
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
 const express = require('express');
