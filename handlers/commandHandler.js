@@ -4,34 +4,115 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// ---------------------------------------------------------------------------
+// In-memory bug store — avoids Discord's 100-char customId limit.
+// Bugs are keyed by a short random ID and expire after 30 minutes.
+// ---------------------------------------------------------------------------
+const _bugStore = new Map();
+const BUG_TTL_MS = 30 * 60 * 1000;
+
+function storeBug(bug) {
+  const id = Math.random().toString(36).slice(2, 10); // 8-char key e.g. "k3x9mq2z"
+  _bugStore.set(id, { bug, expires: Date.now() + BUG_TTL_MS });
+  // Purge expired entries opportunistically
+  for (const [k, v] of _bugStore) if (Date.now() > v.expires) _bugStore.delete(k);
+  return id;
+}
+
+function retrieveBug(id) {
+  const entry = _bugStore.get(id);
+  if (!entry) return null;
+  if (Date.now() > entry.expires) { _bugStore.delete(id); return null; }
+  return entry.bug;
+}
+
 // ClickUp REST API
 const CLICKUP_API = 'https://api.clickup.com/api/v2';
 
-// Workspace list map — Claude uses this to suggest where to file bugs.
-// Filtered to lists meaningful for bug/task triage (excludes archive/weekly noise).
-const CLICKUP_LISTS = [
-  { id: '901113636608', name: 'Bugs',                          folder: 'Epics' },
-  { id: '901113636505', name: '4/19 - 5/3 (Active Sprint)',    folder: 'Sprints' },
-  { id: '901113604581', name: 'Catchall',                      folder: 'Epics' },
-  { id: '901112286095', name: 'Inventory / Chests / Collectibles', folder: 'Epics' },
-  { id: '901113636599', name: 'Player Movement and Interaction', folder: 'Epics' },
-  { id: '901113636661', name: 'UI',                            folder: 'Epics' },
-  { id: '901113636658', name: 'Client Networking',             folder: 'Epics' },
-  { id: '901112260707', name: 'Gameplay Loops',                folder: 'Epics' },
-  { id: '901111865228', name: 'Base Building Epic',            folder: 'Epics' },
-  { id: '901112531922', name: 'Mutators',                      folder: 'Epics' },
-  { id: '901113027450', name: 'Beacon Quests',                 folder: 'Epics' },
-  { id: '901106528870', name: 'Movement',                      folder: 'Core Systems' },
-  { id: '901106458516', name: 'Validity',                      folder: 'Core Systems' },
-  { id: '901113682512', name: 'Spreadsheet Import',            folder: 'Skydew Islands' },
-  { id: '901113636653', name: 'Editor Tooling and QoL',        folder: 'Epics' },
-];
+// Folders to exclude from list picker — archive/historical noise
+const EXCLUDED_FOLDERS = ['sprint archive', 'weeklys', 'archive', 'cleanup'];
 
-// Use OAuth token for MCP-quality search, personal API key for creates
+// Use OAuth token for MCP-quality search, personal API key fallback
 function clickupAuthHeader() {
   return process.env.CLICKUP_OAUTH_TOKEN
     ? `Bearer ${process.env.CLICKUP_OAUTH_TOKEN}`
     : process.env.CLICKUP_API_KEY;
+}
+
+// ---------------------------------------------------------------------------
+// Workspace list cache — fetched on startup, refreshed every hour or on demand
+// ---------------------------------------------------------------------------
+let _listCache = [];
+let _listCacheTime = 0;
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+async function getWorkspaceLists(force = false) {
+  if (!force && _listCache.length > 0 && Date.now() - _listCacheTime < CACHE_TTL_MS) {
+    return _listCache;
+  }
+
+  console.log('🔄 Fetching ClickUp workspace hierarchy...');
+  const lists = [];
+
+  try {
+    // Fetch all spaces
+    const spacesRes = await fetch(
+      `${CLICKUP_API}/team/${process.env.CLICKUP_WORKSPACE_ID}/space?archived=false`,
+      { headers: { Authorization: clickupAuthHeader() } }
+    );
+    if (!spacesRes.ok) throw new Error(`Spaces fetch failed: ${spacesRes.status}`);
+    const { spaces } = await spacesRes.json();
+
+    for (const space of spaces) {
+      // Folderless lists in this space
+      const flRes = await fetch(
+        `${CLICKUP_API}/space/${space.id}/list?archived=false`,
+        { headers: { Authorization: clickupAuthHeader() } }
+      );
+      if (flRes.ok) {
+        const { lists: fl } = await flRes.json();
+        for (const l of (fl || [])) {
+          lists.push({ id: l.id, name: l.name, folder: space.name, space: space.name });
+        }
+      }
+
+      // Folders → lists
+      const fRes = await fetch(
+        `${CLICKUP_API}/space/${space.id}/folder?archived=false`,
+        { headers: { Authorization: clickupAuthHeader() } }
+      );
+      if (!fRes.ok) continue;
+      const { folders } = await fRes.json();
+
+      for (const folder of (folders || [])) {
+        // Skip noisy archive/historical folders
+        if (EXCLUDED_FOLDERS.some(ex => folder.name.toLowerCase().includes(ex))) continue;
+
+        const lRes = await fetch(
+          `${CLICKUP_API}/folder/${folder.id}/list?archived=false`,
+          { headers: { Authorization: clickupAuthHeader() } }
+        );
+        if (!lRes.ok) continue;
+        const { lists: fl } = await lRes.json();
+        for (const l of (fl || [])) {
+          lists.push({ id: l.id, name: l.name, folder: folder.name, space: space.name });
+        }
+      }
+    }
+
+    _listCache = lists;
+    _listCacheTime = Date.now();
+    console.log(`✅ Cached ${lists.length} ClickUp lists`);
+  } catch (err) {
+    console.error('Failed to fetch workspace lists:', err.message);
+    // Return stale cache if available, otherwise empty
+    if (_listCache.length > 0) {
+      console.warn('Using stale list cache');
+      return _listCache;
+    }
+  }
+
+  return _listCache;
 }
 
 async function clickupSearch(keywords) {
@@ -96,6 +177,10 @@ const commands = [
     name: 'bug',
     description: 'Manually file a bug report as a ClickUp ticket immediately',
   },
+  {
+    name: 'refresh-lists',
+    description: 'Force refresh the cached ClickUp workspace lists (admin only)',
+  },
 ];
 
 async function register(client) {
@@ -146,6 +231,15 @@ async function handle(interaction, client) {
         await forwardBugsToN8n(bugs);
         messageHandler.clearBugs();
         return interaction.reply({ content: `✅ Sent ${bugs.length} bug(s) to n8n for processing.` });
+      }
+
+      case 'refresh-lists': {
+        if (!interaction.member.permissions.has('Administrator')) {
+          return interaction.reply({ content: 'Admin only.', ephemeral: true });
+        }
+        await interaction.deferReply({ ephemeral: true });
+        const lists = await getWorkspaceLists(true);
+        return interaction.editReply(`✅ Refreshed — ${lists.length} lists cached from ClickUp.`);
       }
 
       case 'bug': {
@@ -290,8 +384,9 @@ async function handle(interaction, client) {
   // "Create Anyway" after duplicate warning — show list picker instead of auto-creating
   if (interaction.isButton() && interaction.customId.startsWith('create_anyway:')) {
     await interaction.deferUpdate();
-    const bugJson = Buffer.from(interaction.customId.split('create_anyway:')[1], 'base64').toString('utf8');
-    const bug = JSON.parse(bugJson);
+    const bugId = interaction.customId.split('create_anyway:')[1];
+    const bug = retrieveBug(bugId);
+    if (!bug) return interaction.editReply({ content: '❌ Bug report expired — please resubmit.', components: [] });
     try {
       const { embed, components } = await buildListPickerEmbed(bug, null, interaction.user);
       await interaction.editReply({ embeds: [embed], components });
@@ -303,9 +398,11 @@ async function handle(interaction, client) {
   // User picked a list from the picker — create the ticket there
   if (interaction.isButton() && interaction.customId.startsWith('create_in:')) {
     await interaction.deferUpdate();
-    const [, listId, bugEncoded] = interaction.customId.split(':');
-    const bug = JSON.parse(Buffer.from(bugEncoded, 'base64').toString('utf8'));
-    const list = CLICKUP_LISTS.find(l => l.id === listId);
+    const [, listId, bugId] = interaction.customId.split(':');
+    const bug = retrieveBug(bugId);
+    if (!bug) return interaction.editReply({ content: '❌ Bug report expired — please resubmit.', components: [] });
+    const lists = await getWorkspaceLists();
+    const list = lists.find(l => l.id === listId);
     try {
       const url = await clickupCreateTask(bug, listId);
       const createdResult = { isDuplicate: false, matchedTask: null, createdTask: { url }, summary: `Ticket created in **${list?.name ?? listId}**.` };
@@ -329,15 +426,19 @@ async function handle(interaction, client) {
   // "Other list…" — show paginated full list browser
   if (interaction.isButton() && interaction.customId.startsWith('browse_lists:')) {
     await interaction.deferUpdate();
-    const { bug, page } = JSON.parse(Buffer.from(interaction.customId.split('browse_lists:')[1], 'base64').toString('utf8'));
+    const storeId = interaction.customId.split('browse_lists:')[1];
+    const stored = retrieveBug(storeId);
+    if (!stored) return interaction.editReply({ content: '❌ Session expired — please resubmit the bug.', components: [] });
+    const { bug, page } = stored;
+    const allLists = await getWorkspaceLists();
     const pageSize = 4;
     const start = page * pageSize;
-    const pageLists = CLICKUP_LISTS.slice(start, start + pageSize);
-    const bugEncoded = Buffer.from(JSON.stringify(bug)).toString('base64');
+    const pageLists = allLists.slice(start, start + pageSize);
+    const bugId = storeBug(bug);
 
     const buttons = pageLists.map(l =>
       new ButtonBuilder()
-        .setCustomId(`create_in:${l.id}:${bugEncoded}`)
+        .setCustomId(`create_in:${l.id}:${bugId}`)
         .setLabel(l.name.length > 25 ? l.name.slice(0, 23) + '…' : l.name)
         .setStyle(ButtonStyle.Secondary)
     );
@@ -345,12 +446,12 @@ async function handle(interaction, client) {
     // Add prev/next navigation
     const navRow = new ActionRowBuilder();
     if (page > 0) {
-      const prevEncoded = Buffer.from(JSON.stringify({ bug, page: page - 1 })).toString('base64');
-      navRow.addComponents(new ButtonBuilder().setCustomId(`browse_lists:${prevEncoded}`).setLabel('← Back').setStyle(ButtonStyle.Secondary));
+      const prevId = storeBug({ bug, page: page - 1 });
+      navRow.addComponents(new ButtonBuilder().setCustomId(`browse_lists:${prevId}`).setLabel('← Back').setStyle(ButtonStyle.Secondary));
     }
-    if (start + pageSize < CLICKUP_LISTS.length) {
-      const nextEncoded = Buffer.from(JSON.stringify({ bug, page: page + 1 })).toString('base64');
-      navRow.addComponents(new ButtonBuilder().setCustomId(`browse_lists:${nextEncoded}`).setLabel('More →').setStyle(ButtonStyle.Secondary));
+    if (start + pageSize < allLists.length) {
+      const nextId = storeBug({ bug, page: page + 1 });
+      navRow.addComponents(new ButtonBuilder().setCustomId(`browse_lists:${nextId}`).setLabel('More →').setStyle(ButtonStyle.Secondary));
     }
 
     const rows = [new ActionRowBuilder().addComponents(...buttons)];
@@ -360,7 +461,7 @@ async function handle(interaction, client) {
       .setColor(0x5865F2)
       .setTitle('📂 Choose a list')
       .setDescription(pageLists.map(l => `**${l.name}** · ${l.folder}`).join('\n'))
-      .setFooter({ text: `Page ${page + 1} of ${Math.ceil(CLICKUP_LISTS.length / pageSize)}` });
+      .setFooter({ text: `Page ${page + 1} of ${Math.ceil(allLists.length / pageSize)}` });
 
     await interaction.editReply({ embeds: [embed], components: rows });
   }
@@ -422,10 +523,11 @@ isDuplicate=true only for medium or high confidence genuine matches.`,
 }
 
 // ---------------------------------------------------------------------------
-// Step 2: Ask Claude to suggest 3 lists from CLICKUP_LISTS for this bug
+// Step 2: Ask Claude to suggest 3 lists from live workspace cache for this bug
 // ---------------------------------------------------------------------------
 async function suggestLists(bug) {
-  const listContext = CLICKUP_LISTS.map(l => `- ${l.id}: ${l.name} (${l.folder})`).join('\n');
+  const lists = await getWorkspaceLists();
+  const listContext = lists.map(l => `- ${l.id}: ${l.name} (${l.folder}, ${l.space})`).join('\n');
 
   const response = await anthropic.messages.create({
     model:      'claude-sonnet-4-6',
@@ -444,15 +546,13 @@ Return exactly 3 suggestions using only IDs from the provided list.`,
   try {
     const { suggestions } = JSON.parse(rawText.replace(/```json|```/g, '').trim());
     return suggestions
-      .map(s => ({ ...CLICKUP_LISTS.find(l => l.id === s.id), reason: s.reason }))
-      .filter(s => s.id);
+      .map(s => ({ ...lists.find(l => l.id === s.id), reason: s.reason }))
+      .filter(s => s?.id);
   } catch {
-    // Fallback: return top 3 most relevant hardcoded defaults
-    return [
-      { ...CLICKUP_LISTS.find(l => l.id === '901113636608'), reason: 'General bug tracker' },
-      { ...CLICKUP_LISTS.find(l => l.id === '901113636505'), reason: 'Active sprint' },
-      { ...CLICKUP_LISTS.find(l => l.id === '901113604581'), reason: 'Catchall' },
-    ];
+    // Fallback: first list named "Bugs", then first two lists in cache
+    const bugsList = lists.find(l => l.name.toLowerCase() === 'bugs');
+    const fallback = [bugsList, ...lists.filter(l => l !== bugsList)].filter(Boolean).slice(0, 3);
+    return fallback.map((l, i) => ({ ...l, reason: i === 0 ? 'General bug tracker' : 'Available list' }));
   }
 }
 
@@ -488,17 +588,17 @@ function buildDuplicateEmbed(bug, result, user) {
 }
 
 function buildDuplicateButtons(bug, result) {
-  const bugEncoded = Buffer.from(JSON.stringify(bug)).toString('base64');
+  const bugId = storeBug(bug);
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setLabel('View Existing Ticket').setStyle(ButtonStyle.Link).setURL(result.matchedTask.url).setEmoji('🔗'),
-    new ButtonBuilder().setCustomId(`create_anyway:${bugEncoded}`).setLabel('Create Anyway').setStyle(ButtonStyle.Secondary).setEmoji('🆕'),
+    new ButtonBuilder().setCustomId(`create_anyway:${bugId}`).setLabel('Create Anyway').setStyle(ButtonStyle.Secondary).setEmoji('🆕'),
   )];
 }
 
 async function buildListPickerEmbed(bug, result, user) {
   const priorityEmoji = { urgent: '🔴', high: '🟠', normal: '🟡', low: '🟢' }[bug.priority] ?? '⚪';
-  const suggestions = await suggestLists(bug);
-  const bugEncoded  = Buffer.from(JSON.stringify(bug)).toString('base64');
+  const [suggestions, allLists] = await Promise.all([suggestLists(bug), getWorkspaceLists()]);
+  const bugId = storeBug(bug);
 
   const embed = new EmbedBuilder()
     .setColor(0x5865F2)
@@ -516,16 +616,16 @@ async function buildListPickerEmbed(bug, result, user) {
 
   const buttons = suggestions.map((s, i) =>
     new ButtonBuilder()
-      .setCustomId(`create_in:${s.id}:${bugEncoded}`)
+      .setCustomId(`create_in:${s.id}:${bugId}`)
       .setLabel(s.name.length > 25 ? s.name.slice(0, 23) + '…' : s.name)
       .setStyle([ButtonStyle.Primary, ButtonStyle.Secondary, ButtonStyle.Secondary][i])
       .setEmoji(['1️⃣','2️⃣','3️⃣'][i])
   );
 
-  const browseEncoded = Buffer.from(JSON.stringify({ bug, page: 0 })).toString('base64');
+  const browseId = storeBug({ bug, page: 0 });
   buttons.push(
     new ButtonBuilder()
-      .setCustomId(`browse_lists:${browseEncoded}`)
+      .setCustomId(`browse_lists:${browseId}`)
       .setLabel('Other list…')
       .setStyle(ButtonStyle.Secondary)
       .setEmoji('📂')
@@ -662,4 +762,9 @@ function inferTitle(content) {
   return content.slice(0, 80).trim() + (content.length > 80 ? '…' : '');
 }
 
-module.exports = { register, handle, handleBugReaction };
+module.exports = {
+  register,
+  handle,
+  handleBugReaction,
+  refreshListCache: () => getWorkspaceLists(true),
+};
