@@ -1,4 +1,4 @@
-const { REST, Routes, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder, EmbedBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { REST, Routes, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder, EmbedBuilder, ButtonBuilder, ButtonStyle, MessageFlags } = require('discord.js');
 const messageHandler = require('./messageHandler');
 const Anthropic = require('@anthropic-ai/sdk');
 
@@ -191,25 +191,25 @@ async function handle(interaction, client) {
       case 'bugs': {
         const bugs = messageHandler.loadBugs();
         if (bugs.length === 0) {
-          return interaction.reply({ content: 'No pending bugs queued.', ephemeral: true });
+          return interaction.reply({ content: 'No pending bugs queued.', flags: MessageFlags.Ephemeral });
         }
         const lines = bugs.map((b, i) =>
           `**${i + 1}.** <@${b.author}> at ${new Date(b.timestamp).toLocaleTimeString()}: ${b.content.slice(0, 100)}`
         );
         return interaction.reply({
           content: `**${bugs.length} pending bug(s):**\n${lines.join('\n')}`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
       case 'flush-bugs': {
         // Only admins
         if (!interaction.member.permissions.has('Administrator')) {
-          return interaction.reply({ content: 'Admin only.', ephemeral: true });
+          return interaction.reply({ content: 'Admin only.', flags: MessageFlags.Ephemeral });
         }
         const bugs = messageHandler.loadBugs();
         if (bugs.length === 0) {
-          return interaction.reply({ content: 'No bugs to flush.', ephemeral: true });
+          return interaction.reply({ content: 'No bugs to flush.', flags: MessageFlags.Ephemeral });
         }
         // Forward to n8n for processing
         await forwardBugsToN8n(bugs);
@@ -219,9 +219,9 @@ async function handle(interaction, client) {
 
       case 'refresh-lists': {
         if (!interaction.member.permissions.has('Administrator')) {
-          return interaction.reply({ content: 'Admin only.', ephemeral: true });
+          return interaction.reply({ content: 'Admin only.', flags: MessageFlags.Ephemeral });
         }
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const lists = await getWorkspaceLists(true);
         return interaction.editReply(`✅ Refreshed — ${lists.length} lists cached from ClickUp.`);
       }
@@ -274,7 +274,7 @@ async function handle(interaction, client) {
   // ---------------------------------------------------------------------------
   if (interaction.isModalSubmit()) {
     if (interaction.customId === 'bug_modal') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       const bug = {
         title:       interaction.fields.getTextInputValue('title'),
@@ -338,7 +338,7 @@ async function handle(interaction, client) {
   // Modal from build bug button
   if (interaction.isModalSubmit() && interaction.customId.startsWith('bug_modal_build:')) {
     const [, buildId, version] = interaction.customId.split(':');
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const bug = {
       title:       interaction.fields.getTextInputValue('title'),
@@ -717,10 +717,13 @@ async function handleBugReaction(message, user, client) {
   }
 
   // Prevent duplicate processing — check if bot already reacted with ✅ or 🔄
-  const alreadyProcessed = message.reactions.cache.some(
-    r => (r.emoji.name === '✅' || r.emoji.name === '🔄') && r.users.cache.has(client.user.id)
-  );
-  if (alreadyProcessed) return;
+  for (const reactionName of ['✅', '🔄']) {
+    const existing = message.reactions.cache.get(reactionName);
+    if (existing) {
+      const users = await existing.users.fetch().catch(() => null);
+      if (users?.has(client.user.id)) return;
+    }
+  }
 
   // Acknowledge immediately so user knows it's working
   await message.react('🔄').catch(() => {});
