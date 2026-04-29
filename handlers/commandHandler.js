@@ -115,24 +115,7 @@ async function getWorkspaceLists(force = false) {
   return _listCache;
 }
 
-async function clickupSearch(keywords) {
-  const res = await fetch(
-    `${CLICKUP_API}/team/${process.env.CLICKUP_WORKSPACE_ID}/taskSearch?query=${encodeURIComponent(keywords)}&limit=5`,
-    { headers: { Authorization: clickupAuthHeader() } }
-  );
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    console.warn(`ClickUp search failed (${res.status}) for "${keywords}": ${body}`);
-    return [];
-  }
-  const data = await res.json();
-  return (data.tasks || []).map(t => ({
-    id:     t.id,
-    name:   t.name,
-    status: t.status?.status ?? 'unknown',
-    url:    `https://app.clickup.com/t/${t.id}`,
-  }));
-}
+// clickupSearch is no longer used — search now goes through Claude+MCP in checkDuplicate
 
 async function clickupCreateTask(bug, listId) {
   const priorityMap = { urgent: 1, high: 2, normal: 3, low: 4 };
@@ -469,29 +452,27 @@ async function handle(interaction, client) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 1: Check for duplicates only — never auto-creates
+// Step 1: Check for duplicates via Claude + ClickUp MCP (full search quality)
 // ---------------------------------------------------------------------------
+const CLICKUP_MCP_URL = 'https://mcp.clickup.com/mcp';
+const MCP_BETA        = 'mcp-client-2025-11-20';
+
+function mcpServers() {
+  return [{
+    type:                'url',
+    url:                 CLICKUP_MCP_URL,
+    name:                'clickup',
+    authorization_token: process.env.CLICKUP_OAUTH_TOKEN,
+  }];
+}
+
 async function checkDuplicate(bug) {
-  const queries = buildSearchQueries(bug);
-  const resultSets = await Promise.all(queries.map(q => clickupSearch(q)));
-
-  const seen = new Map();
-  for (const tasks of resultSets) for (const t of tasks) if (!seen.has(t.id)) seen.set(t.id, t);
-  const candidates = [...seen.values()];
-
-  if (candidates.length === 0) {
-    return { isDuplicate: false, confidence: 'low', matchedTask: null, summary: 'No similar tasks found.' };
-  }
-
-  const candidateSummary = candidates.map(t =>
-    `- ID: ${t.id} | Status: ${t.status} | Name: ${t.name} | URL: ${t.url}`
-  ).join('\n');
-
-  const response = await anthropic.messages.create({
+  const response = await anthropic.beta.messages.create({
     model:      'claude-sonnet-4-6',
-    max_tokens: 500,
+    max_tokens: 800,
     system: `You are a bug-triage assistant for a game called Skydew Islands.
-Given a new bug report and a list of existing ClickUp tasks, decide if any is a genuine duplicate.
+Search ClickUp using 2-3 focused keyword queries to find tasks similar to the bug report.
+Then decide if a genuine duplicate exists.
 Respond ONLY with JSON — no prose, no markdown fences:
 {
   "isDuplicate": true | false,
@@ -503,10 +484,13 @@ Respond ONLY with JSON — no prose, no markdown fences:
   "similarity": "one sentence why it matches, or null",
   "summary": "2-3 sentence explanation"
 }
-isDuplicate=true only for medium or high confidence genuine matches.`,
+isDuplicate=true only for medium or high confidence genuine matches — not just same topic.`,
     messages: [{ role: 'user', content:
-      `New bug:\nTitle: ${bug.title}\nDescription: ${bug.description}${bug.steps ? '\nSteps: ' + bug.steps : ''}\n\nExisting tasks:\n${candidateSummary}\n\nIs any a duplicate?`
+      `Bug report to check:\nTitle: ${bug.title}\nDescription: ${bug.description}${bug.steps ? '\nSteps: ' + bug.steps : ''}\n\nSearch ClickUp for duplicates and return your analysis as JSON.`
     }],
+    tools:       [{ type: 'mcp_toolset', mcp_server_name: 'clickup' }],
+    mcp_servers: mcpServers(),
+    betas:       [MCP_BETA],
   });
 
   const rawText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
@@ -518,7 +502,7 @@ isDuplicate=true only for medium or high confidence genuine matches.`,
     }
     return { isDuplicate: false, confidence: a.confidence, matchedTask: null, summary: a.summary };
   } catch {
-    console.error('Claude parse error:', rawText);
+    console.error('Claude/MCP parse error:', rawText);
     return { isDuplicate: false, confidence: 'low', matchedTask: null, summary: 'Analysis inconclusive.' };
   }
 }
@@ -550,23 +534,10 @@ Return exactly 3 suggestions using only IDs from the provided list.`,
       .map(s => ({ ...lists.find(l => l.id === s.id), reason: s.reason }))
       .filter(s => s?.id);
   } catch {
-    // Fallback: first list named "Bugs", then first two lists in cache
     const bugsList = lists.find(l => l.name.toLowerCase() === 'bugs');
     const fallback = [bugsList, ...lists.filter(l => l !== bugsList)].filter(Boolean).slice(0, 3);
     return fallback.map((l, i) => ({ ...l, reason: i === 0 ? 'General bug tracker' : 'Available list' }));
   }
-}
-
-// Build 2-3 focused keyword queries
-function buildSearchQueries(bug) {
-  const clean = s => s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/)
-    .filter(w => w.length > 3 && !['with','when','that','this','from','have','been','they','just','only','also','into','does'].includes(w));
-  const titleWords = clean(bug.title);
-  const descWords  = clean(bug.description);
-  const q1 = titleWords.slice(0, 3).join(' ');
-  const q2 = [...new Set([...titleWords, ...descWords])].slice(2, 5).join(' ');
-  const q3 = [titleWords[0], ...descWords.slice(0, 2)].filter(Boolean).join(' ');
-  return [...new Set([q1, q2, q3].filter(q => q.trim().length > 3))];
 }
 
 // ---------------------------------------------------------------------------
