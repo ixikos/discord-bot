@@ -4,8 +4,108 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const CLICKUP_MCP_URL = 'https://mcp.clickup.com/mcp';
-const MCP_BETA        = 'mcp-client-2025-11-20';
+// ClickUp REST API — used directly since mcp.clickup.com requires browser OAuth
+const CLICKUP_API = 'https://api.clickup.com/api/v2';
+
+async function clickupSearch(keywords) {
+  const res = await fetch(
+    `${CLICKUP_API}/team/${process.env.CLICKUP_WORKSPACE_ID}/taskSearch?query=${encodeURIComponent(keywords)}&limit=5`,
+    { headers: { Authorization: process.env.CLICKUP_API_KEY } }
+  );
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data.tasks || []).map(t => ({
+    id:     t.id,
+    name:   t.name,
+    status: t.status?.status ?? 'unknown',
+    url:    `https://app.clickup.com/t/${t.id}`,
+  }));
+}
+
+async function clickupCreateTask(bug) {
+  // Dynamically find the best list — prefer a list named "Bugs" or fall back to the active sprint
+  const listId = await resolveBugListId();
+  const priorityMap = { urgent: 1, high: 2, normal: 3, low: 4 };
+  const description = [
+    bug.description,
+    bug.steps   ? `\n\nSteps to Reproduce:\n${bug.steps}` : '',
+    bug.version ? `\n\nBuild: ${bug.version}` : '',
+    bug.sourceUrl ? `\n\nSource: ${bug.sourceUrl}` : '',
+    `\n\nReported by: ${bug.author}`,
+  ].join('');
+
+  const res = await fetch(`${CLICKUP_API}/list/${listId}/task`, {
+    method:  'POST',
+    headers: { Authorization: process.env.CLICKUP_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name:     bug.title,
+      description,
+      priority: priorityMap[bug.priority] ?? 3,
+      tags:     ['bug'],
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`ClickUp create failed ${res.status}: ${err}`);
+  }
+  const data = await res.json();
+  return `https://app.clickup.com/t/${data.id}`;
+}
+
+// Cache the resolved list ID so we don't hit the hierarchy endpoint on every bug
+let _bugListIdCache = null;
+async function resolveBugListId() {
+  if (_bugListIdCache) return _bugListIdCache;
+
+  // Use env override if set
+  if (process.env.CLICKUP_BUG_LIST_ID) {
+    _bugListIdCache = process.env.CLICKUP_BUG_LIST_ID;
+    return _bugListIdCache;
+  }
+
+  // Otherwise: fetch workspace hierarchy and look for a list named "Bugs" (case-insensitive),
+  // then fall back to the most recently updated sprint list
+  const res = await fetch(
+    `${CLICKUP_API}/team/${process.env.CLICKUP_WORKSPACE_ID}/space?archived=false`,
+    { headers: { Authorization: process.env.CLICKUP_API_KEY } }
+  );
+  if (!res.ok) throw new Error('Could not fetch ClickUp workspace spaces');
+  const { spaces } = await res.json();
+
+  let fallbackListId = null;
+  for (const space of spaces) {
+    const fRes = await fetch(`${CLICKUP_API}/space/${space.id}/folder?archived=false`,
+      { headers: { Authorization: process.env.CLICKUP_API_KEY } });
+    if (!fRes.ok) continue;
+    const { folders } = await fRes.json();
+
+    // Check folderless lists
+    const flRes = await fetch(`${CLICKUP_API}/space/${space.id}/list?archived=false`,
+      { headers: { Authorization: process.env.CLICKUP_API_KEY } });
+    if (flRes.ok) {
+      const { lists } = await flRes.json();
+      for (const l of lists) {
+        if (l.name.toLowerCase().includes('bug')) { _bugListIdCache = l.id; return l.id; }
+        fallbackListId = fallbackListId || l.id;
+      }
+    }
+
+    for (const folder of folders) {
+      const lRes = await fetch(`${CLICKUP_API}/folder/${folder.id}/list?archived=false`,
+        { headers: { Authorization: process.env.CLICKUP_API_KEY } });
+      if (!lRes.ok) continue;
+      const { lists } = await lRes.json();
+      for (const l of lists) {
+        if (l.name.toLowerCase().includes('bug')) { _bugListIdCache = l.id; return l.id; }
+        fallbackListId = fallbackListId || l.id;
+      }
+    }
+  }
+
+  if (!fallbackListId) throw new Error('Could not find any ClickUp list to create bug in');
+  _bugListIdCache = fallbackListId;
+  return fallbackListId;
+}
 
 // ---------------------------------------------------------------------------
 // Define slash commands here — add new ones to this array
@@ -232,111 +332,89 @@ async function handle(interaction, client) {
 }
 
 // ---------------------------------------------------------------------------
-// Claude + ClickUp MCP: search for duplicates, create ticket if none found
+// Search + dedupe via ClickUp REST, analysis via Claude text-only
 // ---------------------------------------------------------------------------
 async function checkDuplicateAndCreate(bug) {
-  const systemPrompt = `You are a bug-triage assistant integrated with ClickUp for a game called Skydew Islands.
+  // Run 2-3 keyword searches in parallel
+  const queries = buildSearchQueries(bug);
+  const resultSets = await Promise.all(queries.map(q => clickupSearch(q)));
 
-Steps:
-1. Search ClickUp using 2-3 different focused keyword queries (2-3 words each) to find tasks similar to the bug report. Search the whole workspace, not just one list.
-2. Decide if a duplicate exists.
-3. If NO duplicate: create a new ClickUp task for this bug. Pick the most appropriate list based on context (e.g. current sprint backlog for active bugs).
-4. Respond ONLY with a JSON object — no prose, no markdown fences:
+  // Dedupe by id
+  const seen = new Map();
+  for (const tasks of resultSets) for (const t of tasks) if (!seen.has(t.id)) seen.set(t.id, t);
+  const candidates = [...seen.values()];
 
+  if (candidates.length === 0) {
+    const url = await clickupCreateTask(bug);
+    return { isDuplicate: false, confidence: 'low', matchedTask: null, createdTask: { url },
+      summary: `No similar tasks found across ${queries.length} searches. Ticket created.` };
+  }
+
+  // Ask Claude to analyse candidates — pure text, no tools needed
+  const candidateSummary = candidates.map(t =>
+    `- ID: ${t.id} | Status: ${t.status} | Name: ${t.name} | URL: ${t.url}`
+  ).join('\n');
+
+  const response = await anthropic.messages.create({
+    model:      'claude-sonnet-4-6',
+    max_tokens: 600,
+    system: `You are a bug-triage assistant for a game called Skydew Islands.
+Given a new bug report and a list of existing ClickUp tasks, decide if any is a genuine duplicate.
+Respond ONLY with JSON — no prose, no markdown fences:
 {
   "isDuplicate": true | false,
   "confidence": "high" | "medium" | "low",
-  "matchedTask": {
-    "id": "task_id",
-    "name": "task name",
-    "url": "https://app.clickup.com/t/...",
-    "status": "status string",
-    "similarity": "one sentence why this matches"
-  } | null,
-  "createdTask": {
-    "url": "https://app.clickup.com/t/..."
-  } | null,
-  "summary": "2-3 sentence analysis of what you found and what action was taken"
+  "matchedTaskId": "id or null",
+  "matchedTaskName": "name or null",
+  "matchedTaskUrl": "url or null",
+  "matchedTaskStatus": "status or null",
+  "similarity": "one sentence why it matches, or null",
+  "summary": "2-3 sentence explanation"
 }
-
-Rules:
-- isDuplicate=true only when confidence is medium or high.
-- If isDuplicate=true, do NOT create a new task. Set createdTask=null.
-- If isDuplicate=false, CREATE the task and populate createdTask.url.
-- When creating, use the bug priority field and include steps in the description if provided.`;
-
-  const userContent = `Bug report:
-Title: ${bug.title}
-Priority: ${bug.priority || 'normal'}
-Author: ${bug.author}
-${bug.version ? `Build: ${bug.version}` : ''}
-Description: ${bug.description}
-${bug.steps ? `Steps to Reproduce:\n${bug.steps}` : ''}
-
-Search ClickUp for duplicates across the whole workspace. If none found, create the ticket.`;
-
-  const response = await anthropic.beta.messages.create({
-    model:      'claude-sonnet-4-6',
-    max_tokens: 1000,
-    system:     systemPrompt,
-    messages:   [{ role: 'user', content: userContent }],
-    tools: [{ type: 'mcp_toolset', mcp_server_name: 'clickup' }],
-    mcp_servers: [{
-      type:                'url',
-      url:                 CLICKUP_MCP_URL,
-      name:                'clickup',
-      authorization_token: process.env.CLICKUP_MCP_TOKEN,
+Rules: isDuplicate=true only for medium or high confidence genuine matches — not just same topic.`,
+    messages: [{ role: 'user', content:
+      `New bug:\nTitle: ${bug.title}\nDescription: ${bug.description}${bug.steps ? '\nSteps: ' + bug.steps : ''}\n\nExisting tasks:\n${candidateSummary}\n\nIs any a duplicate?`
     }],
-    betas: [MCP_BETA],
-  });
-
-  const rawText = response.content
-    .filter(b => b.type === 'text')
-    .map(b => b.text)
-    .join('');
-
-  try {
-    return JSON.parse(rawText.replace(/```json|```/g, '').trim());
-  } catch {
-    console.error('Failed to parse Claude response:', rawText);
-    return {
-      isDuplicate: false,
-      confidence:  'low',
-      matchedTask: null,
-      createdTask: null,
-      summary:     'Could not analyse results — please check ClickUp manually.',
-    };
-  }
-}
-
-// "Create Anyway" button — bypass dupe check, create directly via MCP
-async function createClickUpTicket(bug) {
-  const response = await anthropic.beta.messages.create({
-    model:      'claude-sonnet-4-6',
-    max_tokens: 500,
-    system:     'You are a ClickUp assistant. Create the task as described and respond ONLY with JSON: { "url": "https://app.clickup.com/t/..." }. No prose, no markdown.',
-    messages:   [{
-      role:    'user',
-      content: `Create a ClickUp bug task in the most appropriate active list:
-Title: ${bug.title}
-Priority: ${bug.priority || 'normal'}
-Description: ${bug.description}
-${bug.steps ? `Steps:\n${bug.steps}` : ''}
-Reported by: ${bug.author}`,
-    }],
-    tools: [{ type: 'mcp_toolset', mcp_server_name: 'clickup' }],
-    mcp_servers: [{
-      type:                'url',
-      url:                 CLICKUP_MCP_URL,
-      name:                'clickup',
-      authorization_token: process.env.CLICKUP_MCP_TOKEN,
-    }],
-    betas: [MCP_BETA],
   });
 
   const rawText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
-  const parsed  = JSON.parse(rawText.replace(/```json|```/g, '').trim());
-  return parsed.url;
+  let analysis;
+  try {
+    analysis = JSON.parse(rawText.replace(/```json|```/g, '').trim());
+  } catch {
+    console.error('Claude parse error:', rawText);
+    const url = await clickupCreateTask(bug);
+    return { isDuplicate: false, confidence: 'low', matchedTask: null, createdTask: { url }, summary: 'Analysis inconclusive. Ticket created.' };
+  }
+
+  if (analysis.isDuplicate) {
+    return {
+      isDuplicate: true, confidence: analysis.confidence,
+      matchedTask: { id: analysis.matchedTaskId, name: analysis.matchedTaskName,
+        url: analysis.matchedTaskUrl, status: analysis.matchedTaskStatus, similarity: analysis.similarity },
+      createdTask: null, summary: analysis.summary,
+    };
+  }
+
+  const url = await clickupCreateTask(bug);
+  return { isDuplicate: false, confidence: analysis.confidence, matchedTask: null, createdTask: { url }, summary: analysis.summary };
+}
+
+// Build 2-3 focused keyword queries from the bug report
+function buildSearchQueries(bug) {
+  const clean = s => s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/)
+    .filter(w => w.length > 3 && !['with','when','that','this','from','have','been','they','just','only','also','into','does'].includes(w));
+  const titleWords = clean(bug.title);
+  const descWords  = clean(bug.description);
+  const q1 = titleWords.slice(0, 3).join(' ');
+  const q2 = [...new Set([...titleWords, ...descWords])].slice(2, 5).join(' ');
+  const q3 = [titleWords[0], ...descWords.slice(0, 2)].filter(Boolean).join(' ');
+  return [...new Set([q1, q2, q3].filter(q => q.trim().length > 3))];
+}
+
+// "Create Anyway" — skip dupe check, create directly
+async function createClickUpTicket(bug) {
+  return clickupCreateTask(bug);
 }
 
 // ---------------------------------------------------------------------------
@@ -456,4 +534,64 @@ async function forwardBugsToN8n(bugs, immediate = false) {
   if (!res.ok) throw new Error(`n8n responded with ${res.status}`);
 }
 
-module.exports = { register, handle };
+// ---------------------------------------------------------------------------
+// Bug reaction handler — triggered when someone reacts with 🐛
+// ---------------------------------------------------------------------------
+async function handleBugReaction(message, user, client) {
+  // Ignore empty messages (image-only etc)
+  if (!message.content || message.content.trim().length < 10) {
+    await message.reply(`<@${user.id}> ⚠️ That message doesn't have enough text to file a bug from. Try the \`/bug\` command instead.`);
+    return;
+  }
+
+  // Prevent duplicate processing — check if bot already reacted with ✅ or 🔄
+  const alreadyProcessed = message.reactions.cache.some(
+    r => (r.emoji.name === '✅' || r.emoji.name === '🔄') && r.users.cache.has(client.user.id)
+  );
+  if (alreadyProcessed) return;
+
+  // Acknowledge immediately so user knows it's working
+  await message.react('🔄').catch(() => {});
+
+  const bug = {
+    title:       inferTitle(message.content),
+    description: message.content,
+    steps:       null,
+    priority:    'normal',
+    author:      message.author.username,
+    timestamp:   message.createdAt.toISOString(),
+    sourceUrl:   message.url,
+  };
+
+  try {
+    const result = await checkDuplicateAndCreate(bug);
+
+    // Replace 🔄 with ✅
+    await message.reactions.cache.get('🔄')?.remove().catch(() => {});
+    await message.react('✅').catch(() => {});
+
+    // Reply in the same channel so it's in context
+    const embed = buildPublicEmbed(bug, result, message.author);
+    const components = result.isDuplicate ? buildDuplicateButtons(bug, result) : [];
+    await message.reply({ embeds: [embed], components });
+
+    // Also post to bugs channel if this isn't already it
+    if (message.channelId !== process.env.BUGS_CHANNEL_ID) {
+      await postPublicResult(bug, result, message.author, client);
+    }
+  } catch (err) {
+    console.error('handleBugReaction error:', err);
+    await message.reactions.cache.get('🔄')?.remove().catch(() => {});
+    await message.react('❌').catch(() => {});
+    await message.reply(`<@${user.id}> ❌ Failed to process bug: ${err.message}`);
+  }
+}
+
+// Infer a short title from the first sentence / first ~80 chars of content
+function inferTitle(content) {
+  const firstSentence = content.split(/[.!?\n]/)[0].trim();
+  if (firstSentence.length >= 10 && firstSentence.length <= 100) return firstSentence;
+  return content.slice(0, 80).trim() + (content.length > 80 ? '…' : '');
+}
+
+module.exports = { register, handle, handleBugReaction };
