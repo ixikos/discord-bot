@@ -757,9 +757,13 @@ function buildDuplicateEmbed(bug, result, user) {
 
 function buildDuplicateButtons(bug, result) {
   const bugId = storeBug(bug);
+  // Store a taskRef pointing at the existing matched ticket so Add Details/Images can attach to it
+  const taskRef = storeBug({ taskId: result.matchedTask.id, bug });
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setLabel('View Existing Ticket').setStyle(ButtonStyle.Link).setURL(result.matchedTask.url).setEmoji('🔗'),
+    new ButtonBuilder().setLabel('View Ticket').setStyle(ButtonStyle.Link).setURL(result.matchedTask.url).setEmoji('🔗'),
     new ButtonBuilder().setCustomId(`create_anyway:${bugId}`).setLabel('Create Anyway').setStyle(ButtonStyle.Secondary).setEmoji('🆕'),
+    new ButtonBuilder().setCustomId(`add_details:${taskRef}`).setLabel('Add Details').setStyle(ButtonStyle.Secondary).setEmoji('📝'),
+    new ButtonBuilder().setCustomId(`add_images:${taskRef}`).setLabel('Add Images').setStyle(ButtonStyle.Secondary).setEmoji('🖼️'),
   )];
 }
 
