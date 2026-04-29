@@ -55,6 +55,10 @@ app.post('/webhook/:type', async (req, res) => {
 client.once('ready', async () => {
   console.log(`✅ Bot online as ${client.user.tag}`);
   await commandHandler.register(client);
+  // Pre-warm the ClickUp list cache so first /bug is fast
+  await commandHandler.refreshListCache().catch(err =>
+    console.error('Failed to pre-warm ClickUp list cache:', err.message)
+  );
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -64,6 +68,30 @@ client.on('interactionCreate', async (interaction) => {
 client.on('messageCreate', async (message) => {
   console.log(`Message received in channel: ${message.channelId} | BUGS_CHANNEL_ID: ${process.env.BUGS_CHANNEL_ID}`);
   await messageHandler.handle(message, client);
+});
+
+client.on('messageReactionAdd', async (reaction, user) => {
+  // Log every reaction so we can see exactly what Discord sends
+  console.log(`[reaction] user=${user.tag} bot=${user.bot} emoji.name=${reaction.emoji.name} emoji.id=${reaction.emoji.id} emoji.toString=${reaction.emoji.toString()}`);
+
+  if (user.bot) return;
+
+  // Match both the unicode character and the name string Discord might send
+  const isBugEmoji = reaction.emoji.name === '\u{1F41B}'
+    || reaction.emoji.name === '🐛'
+    || reaction.emoji.name === 'bug';
+
+  if (!isBugEmoji) return;
+
+  console.log(`[reaction] 🐛 detected from ${user.tag} on message ${reaction.message.id}`);
+
+  try {
+    if (reaction.partial) await reaction.fetch();
+    if (reaction.message.partial) await reaction.message.fetch();
+    await commandHandler.handleBugReaction(reaction.message, user, client);
+  } catch (err) {
+    console.error('messageReactionAdd error:', err);
+  }
 });
 
 client.login(process.env.DISCORD_TOKEN);
