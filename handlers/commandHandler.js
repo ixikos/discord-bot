@@ -139,6 +139,7 @@ async function handle(interaction, client) {
         const embed  = buildResultEmbed(bug, result, interaction.user);
         const components = result.isDuplicate ? buildDuplicateButtons(bug, result) : [];
         await interaction.editReply({ embeds: [embed], components });
+        await postPublicResult(bug, result, interaction.user, client);
       } catch (err) {
         console.error('Bug modal error:', err);
         await interaction.editReply(`❌ Failed to process bug report: ${err.message}`);
@@ -198,6 +199,7 @@ async function handle(interaction, client) {
       const embed  = buildResultEmbed(bug, result, interaction.user);
       const components = result.isDuplicate ? buildDuplicateButtons(bug, result) : [];
       await interaction.editReply({ embeds: [embed], components });
+      await postPublicResult(bug, result, interaction.user, client);
     } catch (err) {
       console.error('Build bug modal error:', err);
       await interaction.editReply(`❌ Failed: ${err.message}`);
@@ -211,6 +213,7 @@ async function handle(interaction, client) {
 
     try {
       const ticketUrl = await createClickUpTicket(bug);
+      const createdResult = { isDuplicate: false, confidence: 'low', matchedTask: null, createdTask: { url: ticketUrl }, summary: 'Created despite possible duplicate.' };
       await interaction.editReply({
         embeds: [
           new EmbedBuilder()
@@ -221,6 +224,7 @@ async function handle(interaction, client) {
         ],
         components: [],
       });
+      await postPublicResult(bug, createdResult, interaction.user, client);
     } catch (err) {
       await interaction.editReply({ content: `❌ Failed to create ticket: ${err.message}`, components: [] });
     }
@@ -276,6 +280,7 @@ Search ClickUp for duplicates across the whole workspace. If none found, create 
     max_tokens: 1000,
     system:     systemPrompt,
     messages:   [{ role: 'user', content: userContent }],
+    tools: [{ type: 'mcp_toolset', mcp_server_name: 'clickup' }],
     mcp_servers: [{
       type:                'url',
       url:                 CLICKUP_MCP_URL,
@@ -319,6 +324,7 @@ Description: ${bug.description}
 ${bug.steps ? `Steps:\n${bug.steps}` : ''}
 Reported by: ${bug.author}`,
     }],
+    tools: [{ type: 'mcp_toolset', mcp_server_name: 'clickup' }],
     mcp_servers: [{
       type:                'url',
       url:                 CLICKUP_MCP_URL,
@@ -384,6 +390,51 @@ function buildDuplicateButtons(bug, result) {
       .setEmoji('🆕'),
   );
   return [row];
+}
+
+// ---------------------------------------------------------------------------
+// Public channel post — visible to everyone in BUGS_CHANNEL_ID
+// ---------------------------------------------------------------------------
+async function postPublicResult(bug, result, user, client) {
+  const channel = await client.channels.fetch(process.env.BUGS_CHANNEL_ID).catch(() => null);
+  if (!channel) return;
+  const embed      = buildPublicEmbed(bug, result, user);
+  const components = result.isDuplicate ? buildDuplicateButtons(bug, result) : [];
+  await channel.send({ embeds: [embed], components });
+}
+
+function buildPublicEmbed(bug, result, user) {
+  const priorityEmoji = { urgent: '🔴', high: '🟠', normal: '🟡', low: '🟢' }[bug.priority] ?? '⚪';
+  const reporter = `<@${user.id}>`;
+
+  if (result.isDuplicate && result.matchedTask) {
+    const confidenceEmoji = { high: '🎯', medium: '🔍', low: '🤔' }[result.confidence] ?? '🔍';
+    return new EmbedBuilder()
+      .setColor(0xFFA500)
+      .setTitle('⚠️ Duplicate Bug Report')
+      .setDescription(`${reporter} reported a bug that may already be tracked.`)
+      .addFields(
+        { name: `${priorityEmoji} Reported`, value: `**${bug.title}**\n${bug.description.slice(0, 200)}${bug.description.length > 200 ? '…' : ''}` },
+        {
+          name:  `${confidenceEmoji} Existing Ticket (${result.confidence} confidence)`,
+          value: `**[${result.matchedTask.name}](${result.matchedTask.url})**\nStatus: \`${result.matchedTask.status}\`\n${result.matchedTask.similarity}`,
+        },
+      )
+      .setFooter({ text: `Reported by ${user.username} · Use "Create Anyway" if this is a distinct issue` })
+      .setTimestamp();
+  }
+
+  return new EmbedBuilder()
+    .setColor(0x57F287)
+    .setTitle('🐛 New Bug Ticket Created')
+    .setDescription(`${reporter} filed a new bug report.`)
+    .addFields(
+      { name: `${priorityEmoji} ${bug.title}`, value: bug.description.slice(0, 300) + (bug.description.length > 300 ? '…' : '') },
+      { name: 'ClickUp', value: result.createdTask?.url ? `[View Ticket](${result.createdTask.url})` : 'Created', inline: true },
+      { name: 'Priority', value: `${priorityEmoji} ${bug.priority || 'normal'}`, inline: true },
+      ...(bug.version ? [{ name: 'Build', value: bug.version, inline: true }] : []),
+    )
+    .setTimestamp();
 }
 
 // ---------------------------------------------------------------------------
