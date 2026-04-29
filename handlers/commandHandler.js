@@ -121,7 +121,8 @@ async function clickupSearch(keywords) {
     { headers: { Authorization: clickupAuthHeader() } }
   );
   if (!res.ok) {
-    console.warn(`ClickUp search failed (${res.status}) for: ${keywords}`);
+    const body = await res.text().catch(() => '');
+    console.warn(`ClickUp search failed (${res.status}) for "${keywords}": ${body}`);
     return [];
   }
   const data = await res.json();
@@ -603,16 +604,19 @@ async function buildListPickerEmbed(bug, result, user) {
   const embed = new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle('📋 Where should this bug go?')
-    .setDescription(`No duplicate found for **${bug.title}**\nPick a list to file it in:`)
-    .addFields(
-      suggestions.map((s, i) => ({
-        name:   `${['1️⃣','2️⃣','3️⃣'][i]} ${s.name}`,
-        value:  `*${s.folder}* · ${s.reason}`,
-        inline: false,
-      }))
-    )
     .setFooter({ text: 'Only visible to you' })
     .setTimestamp();
+
+  if (suggestions.length > 0) {
+    embed.setDescription(`No duplicate found for **${bug.title}**\nPick a list to file it in:`);
+    embed.addFields(suggestions.map((s, i) => ({
+      name:  `${['1️⃣','2️⃣','3️⃣'][i]} ${s.name}`,
+      value: `*${s.folder}* · ${s.reason}`,
+      inline: false,
+    })));
+  } else {
+    embed.setDescription(`No duplicate found for **${bug.title}**\nCouldn't load suggested lists — use **Other list…** to browse all options.`);
+  }
 
   const buttons = suggestions.map((s, i) =>
     new ButtonBuilder()
