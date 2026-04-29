@@ -452,57 +452,89 @@ async function handle(interaction, client) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 1: Check for duplicates via Claude + ClickUp MCP (full search quality)
+// Step 1: Fetch all tasks from relevant lists, then let Claude do fuzzy matching
 // ---------------------------------------------------------------------------
-const CLICKUP_MCP_URL = 'https://mcp.clickup.com/mcp';
-const MCP_BETA        = 'mcp-client-2025-11-20';
 
-function mcpServers() {
-  return [{
-    type:                'url',
-    url:                 CLICKUP_MCP_URL,
-    name:                'clickup',
-    authorization_token: process.env.CLICKUP_OAUTH_TOKEN,
-  }];
+// Lists to search for duplicates — active sprint + bugs epic
+const SEARCH_LIST_IDS = (process.env.CLICKUP_SEARCH_LISTS || '901113636505,901113636608').split(',');
+
+async function fetchAllTasksForSearch() {
+  const allTasks = [];
+  for (const listId of SEARCH_LIST_IDS) {
+    let page = 0;
+    while (true) {
+      const res = await fetch(
+        `${CLICKUP_API}/list/${listId}/task?archived=false&subtasks=true&page=${page}`,
+        { headers: { Authorization: clickupAuthHeader() } }
+      );
+      if (!res.ok) {
+        console.warn(`Failed to fetch tasks from list ${listId}: ${res.status}`);
+        break;
+      }
+      const data = await res.json();
+      const tasks = data.tasks || [];
+      allTasks.push(...tasks.map(t => ({
+        id:     t.id,
+        name:   t.name,
+        status: t.status?.status ?? 'unknown',
+        url:    `https://app.clickup.com/t/${t.id}`,
+        list:   t.list?.name ?? listId,
+      })));
+      // ClickUp paginates at 100 tasks/page; stop if we got fewer than 100
+      if (tasks.length < 100) break;
+      page++;
+    }
+  }
+  return allTasks;
 }
 
 async function checkDuplicate(bug) {
-  const response = await anthropic.beta.messages.create({
+  const tasks = await fetchAllTasksForSearch();
+
+  if (tasks.length === 0) {
+    console.warn('No tasks fetched for duplicate check — check CLICKUP_API_KEY and list IDs');
+    return { isDuplicate: false, confidence: 'low', matchedTask: null, summary: 'Could not fetch tasks for comparison.' };
+  }
+
+  const taskList = tasks.map(t => `- [${t.id}] (${t.status}) ${t.name}`).join('\n');
+
+  const response = await anthropic.messages.create({
     model:      'claude-sonnet-4-6',
-    max_tokens: 800,
+    max_tokens: 600,
     system: `You are a bug-triage assistant for a game called Skydew Islands.
-Search ClickUp using 2-3 focused keyword queries to find tasks similar to the bug report.
-Then decide if a genuine duplicate exists.
+You will be given a new bug report and a full list of existing tasks.
+Use semantic reasoning to decide if any existing task is a genuine duplicate — even if the wording is different.
 Respond ONLY with JSON — no prose, no markdown fences:
 {
   "isDuplicate": true | false,
   "confidence": "high" | "medium" | "low",
   "matchedTaskId": "id or null",
   "matchedTaskName": "name or null",
-  "matchedTaskUrl": "url or null",
+  "matchedTaskUrl": "https://app.clickup.com/t/{id} or null",
   "matchedTaskStatus": "status or null",
   "similarity": "one sentence why it matches, or null",
   "summary": "2-3 sentence explanation"
 }
-isDuplicate=true only for medium or high confidence genuine matches — not just same topic.`,
+isDuplicate=true only for medium or high confidence genuine matches — not just same general topic.`,
     messages: [{ role: 'user', content:
-      `Bug report to check:\nTitle: ${bug.title}\nDescription: ${bug.description}${bug.steps ? '\nSteps: ' + bug.steps : ''}\n\nSearch ClickUp for duplicates and return your analysis as JSON.`
+      `New bug report:\nTitle: ${bug.title}\nDescription: ${bug.description}${bug.steps ? '\nSteps: ' + bug.steps : ''}\n\nExisting tasks (${tasks.length} total):\n${taskList}\n\nIs any existing task a genuine duplicate of this bug?`
     }],
-    tools:       [{ type: 'mcp_toolset', mcp_server_name: 'clickup' }],
-    mcp_servers: mcpServers(),
-    betas:       [MCP_BETA],
   });
 
   const rawText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
   try {
     const a = JSON.parse(rawText.replace(/```json|```/g, '').trim());
+    // Build URL from id if not provided
+    if (a.matchedTaskId && !a.matchedTaskUrl) {
+      a.matchedTaskUrl = `https://app.clickup.com/t/${a.matchedTaskId}`;
+    }
     if (a.isDuplicate) {
       return { isDuplicate: true, confidence: a.confidence, summary: a.summary,
         matchedTask: { id: a.matchedTaskId, name: a.matchedTaskName, url: a.matchedTaskUrl, status: a.matchedTaskStatus, similarity: a.similarity } };
     }
     return { isDuplicate: false, confidence: a.confidence, matchedTask: null, summary: a.summary };
   } catch {
-    console.error('Claude/MCP parse error:', rawText);
+    console.error('Claude parse error:', rawText);
     return { isDuplicate: false, confidence: 'low', matchedTask: null, summary: 'Analysis inconclusive.' };
   }
 }
