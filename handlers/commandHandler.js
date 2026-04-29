@@ -5,6 +5,29 @@ const Anthropic = require('@anthropic-ai/sdk');
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ---------------------------------------------------------------------------
+// Pending image upload store — maps a user+channel key to a ClickUp task ID.
+// When the bot asks a user to upload images, it watches for their next message.
+// ---------------------------------------------------------------------------
+const _pendingImages = new Map();
+const PENDING_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function setPendingImage(userId, channelId, taskId) {
+  _pendingImages.set(`${userId}:${channelId}`, { taskId, expires: Date.now() + PENDING_TTL_MS });
+}
+
+function getPendingImage(userId, channelId) {
+  const key = `${userId}:${channelId}`;
+  const entry = _pendingImages.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expires) { _pendingImages.delete(key); return null; }
+  return entry.taskId;
+}
+
+function clearPendingImage(userId, channelId) {
+  _pendingImages.delete(`${userId}:${channelId}`);
+}
+
+// ---------------------------------------------------------------------------
 // In-memory bug store — avoids Discord's 100-char customId limit.
 // Bugs are keyed by a short random ID and expire after 30 minutes.
 // ---------------------------------------------------------------------------
@@ -116,6 +139,50 @@ async function getWorkspaceLists(force = false) {
 }
 
 // clickupSearch is no longer used — search now goes through Claude+MCP in checkDuplicate
+
+async function clickupUpdateTask(taskId, { extraDescription, steps, severity }) {
+  const priorityMap = { urgent: 1, high: 2, normal: 3, low: 4 };
+  const body = {};
+  const parts = [];
+  if (extraDescription) parts.push(extraDescription);
+  if (steps) parts.push(`\n\nAdditional Steps:\n${steps}`);
+  if (parts.length) body.description = parts.join('');
+  if (severity && priorityMap[severity]) body.priority = priorityMap[severity];
+
+  const res = await fetch(`${CLICKUP_API}/task/${taskId}`, {
+    method:  'PUT',
+    headers: { Authorization: clickupAuthHeader(), 'Content-Type': 'application/json' },
+    body:    JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`ClickUp update failed ${res.status}: ${err}`);
+  }
+}
+
+async function clickupAttachImage(taskId, imageUrl, filename) {
+  // Fetch the image from Discord CDN
+  const imgRes = await fetch(imageUrl);
+  if (!imgRes.ok) throw new Error(`Failed to fetch image: ${imgRes.status}`);
+  const buffer = Buffer.from(await imgRes.arrayBuffer());
+
+  // Build multipart/form-data manually using FormData (Node 18+ built-in)
+  const { FormData, Blob } = globalThis;
+  const form = new FormData();
+  form.append('attachment', new Blob([buffer]), filename);
+  form.append('filename', filename);
+
+  const res = await fetch(`${CLICKUP_API}/task/${taskId}/attachment`, {
+    method:  'POST',
+    headers: { Authorization: clickupAuthHeader() },
+    body:    form,
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`ClickUp attachment failed ${res.status}: ${err}`);
+  }
+  return await res.json();
+}
 
 async function clickupCreateTask(bug, listId) {
   const priorityMap = { urgent: 1, high: 2, normal: 3, low: 4 };
@@ -335,6 +402,30 @@ async function handle(interaction, client) {
     }
   }
 
+  // "Add Details" modal submission — update the ClickUp ticket
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('detail_modal:')) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const taskRef = interaction.customId.split('detail_modal:')[1];
+    const stored = retrieveBug(taskRef);
+    if (!stored) return interaction.editReply('❌ Session expired — ticket may still exist, check ClickUp directly.');
+
+    const { taskId } = stored;
+    const extraDescription = interaction.fields.getTextInputValue('extra_description');
+    const steps            = interaction.fields.getTextInputValue('steps');
+    const severity         = interaction.fields.getTextInputValue('severity') || null;
+
+    if (!extraDescription && !steps && !severity) {
+      return interaction.editReply('Nothing to update — all fields were empty.');
+    }
+
+    try {
+      await clickupUpdateTask(taskId, { extraDescription, steps, severity });
+      await interaction.editReply(`✅ Ticket updated! [View in ClickUp](https://app.clickup.com/t/${taskId})`);
+    } catch (err) {
+      await interaction.editReply(`❌ Failed to update ticket: ${err.message}`);
+    }
+  }
+
   // Modal from build bug button
   if (interaction.isModalSubmit() && interaction.customId.startsWith('bug_modal_build:')) {
     const [, buildId, version] = interaction.customId.split(':');
@@ -389,22 +480,95 @@ async function handle(interaction, client) {
     const list = lists.find(l => l.id === listId);
     try {
       const url = await clickupCreateTask(bug, listId);
+      const taskId = url.split('/t/')[1];
+
+      // Auto-upload any images that came with the original message
+      let imageNote = '';
+      if (bug.images?.length > 0) {
+        const uploads = await Promise.allSettled(
+          bug.images.map(img => clickupAttachImage(taskId, img.url, img.name))
+        );
+        const ok   = uploads.filter(r => r.status === 'fulfilled').length;
+        const fail = uploads.filter(r => r.status === 'rejected').length;
+        imageNote = ok > 0 ? `\n📎 ${ok} image${ok !== 1 ? 's' : ''} attached automatically` : '';
+        if (fail > 0) imageNote += ` (${fail} failed)`;
+      }
+
+      const taskRef = storeBug({ taskId, bug });
       const createdResult = { isDuplicate: false, matchedTask: null, createdTask: { url }, summary: `Ticket created in **${list?.name ?? listId}**.` };
       await interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x57F287)
             .setTitle('✅ Bug Ticket Created')
-            .setDescription(`Filed in **${list?.name ?? listId}** (${list?.folder ?? ''})`)
+            .setDescription(`Filed in **${list?.name ?? listId}** (${list?.folder ?? ''})${imageNote}`)
             .addFields({ name: bug.title, value: `[View Ticket](${url})` })
             .setTimestamp(),
         ],
-        components: [],
+        components: [buildTicketActionsRow(taskRef)],
       });
       await postPublicResult(bug, createdResult, interaction.user, client);
     } catch (err) {
       await interaction.editReply({ content: `❌ Failed to create ticket: ${err.message}`, components: [] });
     }
+  }
+
+  // "Add Details" button — open modal to add extra info to the ticket
+  if (interaction.isButton() && interaction.customId.startsWith('add_details:')) {
+    const taskRef = interaction.customId.split('add_details:')[1];
+    const stored  = retrieveBug(taskRef);
+    const bug     = stored?.bug ?? null;
+
+    // Truncate to Discord's 4000 char max for placeholder, 1024 for setValue
+    const descPlaceholder  = bug?.description ? bug.description.slice(0, 990) + (bug.description.length > 990 ? '…' : '') : 'Any extra context, environment details, frequency...';
+    const stepsPlaceholder = bug?.steps        ? bug.steps.slice(0, 990)                                                   : '1. Open inventory\n2. Move item\n3. Observe blank slot';
+    const currentPriority  = bug?.priority     ? bug.priority                                                              : 'normal';
+
+    const modal = new ModalBuilder()
+      .setCustomId(`detail_modal:${taskRef}`)
+      .setTitle('Edit / Add Details');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('extra_description')
+          .setLabel('Description (edit or append)')
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(false)
+          .setPlaceholder(descPlaceholder)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('steps')
+          .setLabel('Steps to Reproduce')
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(false)
+          .setPlaceholder(stepsPlaceholder)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('severity')
+          .setLabel('Severity (low / normal / high / urgent)')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setValue(currentPriority)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+
+  // "Add Images" button — prompt user to reply with screenshots
+  if (interaction.isButton() && interaction.customId.startsWith('add_images:')) {
+    const taskRef = interaction.customId.split('add_images:')[1];
+    const stored = retrieveBug(taskRef);
+    if (!stored) return interaction.reply({ content: '❌ Session expired.', flags: MessageFlags.Ephemeral });
+    const { taskId } = stored;
+
+    // Register this user+channel as waiting for images
+    setPendingImage(interaction.user.id, interaction.channelId, taskId);
+
+    await interaction.reply({
+      content: `📎 <@${interaction.user.id}> Upload your screenshots by replying to this message with images attached. I'll add them to the ticket automatically. *(You have 5 minutes)*`,
+    });
   }
 
   // "Other list…" — show paginated full list browser
@@ -599,6 +763,21 @@ function buildDuplicateButtons(bug, result) {
   )];
 }
 
+function buildTicketActionsRow(taskRef) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`add_details:${taskRef}`)
+      .setLabel('Add Details')
+      .setStyle(ButtonStyle.Secondary)
+      .setEmoji('📝'),
+    new ButtonBuilder()
+      .setCustomId(`add_images:${taskRef}`)
+      .setLabel('Add Images')
+      .setStyle(ButtonStyle.Secondary)
+      .setEmoji('🖼️'),
+  );
+}
+
 async function buildListPickerEmbed(bug, result, user) {
   const priorityEmoji = { urgent: '🔴', high: '🟠', normal: '🟡', low: '🟢' }[bug.priority] ?? '⚪';
   const [suggestions, allLists] = await Promise.all([suggestLists(bug), getWorkspaceLists()]);
@@ -710,9 +889,11 @@ async function forwardBugsToN8n(bugs, immediate = false) {
 // Bug reaction handler — triggered when someone reacts with 🐛
 // ---------------------------------------------------------------------------
 async function handleBugReaction(message, user, client) {
-  // Ignore empty messages (image-only etc)
-  if (!message.content || message.content.trim().length < 10) {
-    await message.reply(`<@${user.id}> ⚠️ That message doesn't have enough text to file a bug from. Try the \`/bug\` command instead.`);
+  // Allow image-only messages or short captions if there are attachments
+  const hasImages = message.attachments.size > 0;
+  const hasText   = message.content && message.content.trim().length >= 10;
+  if (!hasText && !hasImages) {
+    await message.reply(`<@${user.id}> ⚠️ That message doesn't have enough content to file a bug from. Try the \`/bug\` command instead.`);
     return;
   }
 
@@ -728,6 +909,11 @@ async function handleBugReaction(message, user, client) {
   // Acknowledge immediately so user knows it's working
   await message.react('🔄').catch(() => {});
 
+  // Collect any images attached to the original message
+  const messageImages = [...message.attachments.values()]
+    .filter(a => a.contentType?.startsWith('image/') || /\.(png|jpg|jpeg|gif|webp)$/i.test(a.name ?? ''))
+    .map(a => ({ url: a.url, name: a.name ?? 'screenshot.png' }));
+
   const bug = {
     title:       inferTitle(message.content),
     description: message.content,
@@ -736,6 +922,7 @@ async function handleBugReaction(message, user, client) {
     author:      message.author.username,
     timestamp:   message.createdAt.toISOString(),
     sourceUrl:   message.url,
+    images:      messageImages,
   };
 
   try {
@@ -767,14 +954,57 @@ async function handleBugReaction(message, user, client) {
 
 // Infer a short title from the first sentence / first ~80 chars of content
 function inferTitle(content) {
+  if (!content || content.trim().length < 3) return 'Bug report (see images)';
   const firstSentence = content.split(/[.!?\n]/)[0].trim();
   if (firstSentence.length >= 10 && firstSentence.length <= 100) return firstSentence;
   return content.slice(0, 80).trim() + (content.length > 80 ? '…' : '');
+}
+
+// ---------------------------------------------------------------------------
+// Image upload handler — called from messageCreate when a pending upload exists
+// ---------------------------------------------------------------------------
+async function handleImageUpload(message, client) {
+  if (message.author.bot) return;
+  if (message.attachments.size === 0) return;
+
+  const taskId = getPendingImage(message.author.id, message.channelId);
+  if (!taskId) return;
+
+  // Clear pending so we don't process follow-up messages
+  clearPendingImage(message.author.id, message.channelId);
+
+  const images = [...message.attachments.values()].filter(a =>
+    a.contentType?.startsWith('image/') || /\.(png|jpg|jpeg|gif|webp)$/i.test(a.name)
+  );
+
+  if (images.length === 0) {
+    await message.reply('⚠️ No image attachments found. Please upload PNG, JPG, or GIF files.');
+    return;
+  }
+
+  await message.react('🔄').catch(() => {});
+
+  const results = await Promise.allSettled(
+    images.map(img => clickupAttachImage(taskId, img.url, img.name))
+  );
+
+  const succeeded = results.filter(r => r.status === 'fulfilled').length;
+  const failed    = results.filter(r => r.status === 'rejected').length;
+
+  await message.reactions.cache.get('🔄')?.remove().catch(() => {});
+  await message.react('✅').catch(() => {});
+
+  const summary = failed > 0
+    ? `✅ ${succeeded} image${succeeded !== 1 ? 's' : ''} uploaded, ❌ ${failed} failed.`
+    : `✅ ${succeeded} image${succeeded !== 1 ? 's' : ''} added to the ticket!`;
+
+  await message.reply(`${summary} [View ticket](https://app.clickup.com/t/${taskId})`);
 }
 
 module.exports = {
   register,
   handle,
   handleBugReaction,
+  handleImageUpload,
   refreshListCache: () => getWorkspaceLists(true),
 };
