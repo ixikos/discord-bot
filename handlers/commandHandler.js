@@ -7,12 +7,18 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // ClickUp REST API — used directly since mcp.clickup.com requires browser OAuth
 const CLICKUP_API = 'https://api.clickup.com/api/v2';
 
+// "Bugs" list under Epics in Skydew Islands (override via CLICKUP_BUG_LIST_ID env var)
+const CLICKUP_BUG_LIST_ID = process.env.CLICKUP_BUG_LIST_ID || '901113636608';
+
 async function clickupSearch(keywords) {
   const res = await fetch(
     `${CLICKUP_API}/team/${process.env.CLICKUP_WORKSPACE_ID}/taskSearch?query=${encodeURIComponent(keywords)}&limit=5`,
     { headers: { Authorization: process.env.CLICKUP_API_KEY } }
   );
-  if (!res.ok) return [];
+  if (!res.ok) {
+    console.warn(`ClickUp search failed (${res.status}) for: ${keywords}`);
+    return [];
+  }
   const data = await res.json();
   return (data.tasks || []).map(t => ({
     id:     t.id,
@@ -23,18 +29,16 @@ async function clickupSearch(keywords) {
 }
 
 async function clickupCreateTask(bug) {
-  // Dynamically find the best list — prefer a list named "Bugs" or fall back to the active sprint
-  const listId = await resolveBugListId();
   const priorityMap = { urgent: 1, high: 2, normal: 3, low: 4 };
   const description = [
     bug.description,
-    bug.steps   ? `\n\nSteps to Reproduce:\n${bug.steps}` : '',
-    bug.version ? `\n\nBuild: ${bug.version}` : '',
+    bug.steps     ? `\n\nSteps to Reproduce:\n${bug.steps}` : '',
+    bug.version   ? `\n\nBuild: ${bug.version}` : '',
     bug.sourceUrl ? `\n\nSource: ${bug.sourceUrl}` : '',
     `\n\nReported by: ${bug.author}`,
   ].join('');
 
-  const res = await fetch(`${CLICKUP_API}/list/${listId}/task`, {
+  const res = await fetch(`${CLICKUP_API}/list/${CLICKUP_BUG_LIST_ID}/task`, {
     method:  'POST',
     headers: { Authorization: process.env.CLICKUP_API_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -50,61 +54,6 @@ async function clickupCreateTask(bug) {
   }
   const data = await res.json();
   return `https://app.clickup.com/t/${data.id}`;
-}
-
-// Cache the resolved list ID so we don't hit the hierarchy endpoint on every bug
-let _bugListIdCache = null;
-async function resolveBugListId() {
-  if (_bugListIdCache) return _bugListIdCache;
-
-  // Use env override if set
-  if (process.env.CLICKUP_BUG_LIST_ID) {
-    _bugListIdCache = process.env.CLICKUP_BUG_LIST_ID;
-    return _bugListIdCache;
-  }
-
-  // Otherwise: fetch workspace hierarchy and look for a list named "Bugs" (case-insensitive),
-  // then fall back to the most recently updated sprint list
-  const res = await fetch(
-    `${CLICKUP_API}/team/${process.env.CLICKUP_WORKSPACE_ID}/space?archived=false`,
-    { headers: { Authorization: process.env.CLICKUP_API_KEY } }
-  );
-  if (!res.ok) throw new Error('Could not fetch ClickUp workspace spaces');
-  const { spaces } = await res.json();
-
-  let fallbackListId = null;
-  for (const space of spaces) {
-    const fRes = await fetch(`${CLICKUP_API}/space/${space.id}/folder?archived=false`,
-      { headers: { Authorization: process.env.CLICKUP_API_KEY } });
-    if (!fRes.ok) continue;
-    const { folders } = await fRes.json();
-
-    // Check folderless lists
-    const flRes = await fetch(`${CLICKUP_API}/space/${space.id}/list?archived=false`,
-      { headers: { Authorization: process.env.CLICKUP_API_KEY } });
-    if (flRes.ok) {
-      const { lists } = await flRes.json();
-      for (const l of lists) {
-        if (l.name.toLowerCase().includes('bug')) { _bugListIdCache = l.id; return l.id; }
-        fallbackListId = fallbackListId || l.id;
-      }
-    }
-
-    for (const folder of folders) {
-      const lRes = await fetch(`${CLICKUP_API}/folder/${folder.id}/list?archived=false`,
-        { headers: { Authorization: process.env.CLICKUP_API_KEY } });
-      if (!lRes.ok) continue;
-      const { lists } = await lRes.json();
-      for (const l of lists) {
-        if (l.name.toLowerCase().includes('bug')) { _bugListIdCache = l.id; return l.id; }
-        fallbackListId = fallbackListId || l.id;
-      }
-    }
-  }
-
-  if (!fallbackListId) throw new Error('Could not find any ClickUp list to create bug in');
-  _bugListIdCache = fallbackListId;
-  return fallbackListId;
 }
 
 // ---------------------------------------------------------------------------
