@@ -3,7 +3,9 @@ const messageHandler = require('./messageHandler');
 const Anthropic = require('@anthropic-ai/sdk');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
 const CLICKUP_MCP_URL = 'https://mcp.clickup.com/mcp';
+const MCP_BETA        = 'mcp-client-2025-11-20';
 
 // ---------------------------------------------------------------------------
 // Define slash commands here — add new ones to this array
@@ -226,15 +228,15 @@ async function handle(interaction, client) {
 }
 
 // ---------------------------------------------------------------------------
-// Claude + ClickUp MCP: check for duplicates, create ticket if none found
+// Claude + ClickUp MCP: search for duplicates, create ticket if none found
 // ---------------------------------------------------------------------------
 async function checkDuplicateAndCreate(bug) {
   const systemPrompt = `You are a bug-triage assistant integrated with ClickUp for a game called Skydew Islands.
 
-Your job:
-1. Search ClickUp using 2-3 different focused keyword queries (2-3 words each) to find tasks similar to the bug report.
+Steps:
+1. Search ClickUp using 2-3 different focused keyword queries (2-3 words each) to find tasks similar to the bug report. Search the whole workspace, not just one list.
 2. Decide if a duplicate exists.
-3. If NO duplicate: create a new ClickUp task for this bug in the appropriate list.
+3. If NO duplicate: create a new ClickUp task for this bug. Pick the most appropriate list based on context (e.g. current sprint backlog for active bugs).
 4. Respond ONLY with a JSON object — no prose, no markdown fences:
 
 {
@@ -257,7 +259,7 @@ Rules:
 - isDuplicate=true only when confidence is medium or high.
 - If isDuplicate=true, do NOT create a new task. Set createdTask=null.
 - If isDuplicate=false, CREATE the task and populate createdTask.url.
-- When creating, use the bug's priority field and include steps in the task description if provided.`;
+- When creating, use the bug priority field and include steps in the description if provided.`;
 
   const userContent = `Bug report:
 Title: ${bug.title}
@@ -267,14 +269,20 @@ ${bug.version ? `Build: ${bug.version}` : ''}
 Description: ${bug.description}
 ${bug.steps ? `Steps to Reproduce:\n${bug.steps}` : ''}
 
-Search ClickUp for duplicates. If none found, create the ticket.`;
+Search ClickUp for duplicates across the whole workspace. If none found, create the ticket.`;
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
+  const response = await anthropic.beta.messages.create({
+    model:      'claude-sonnet-4-20250514',
     max_tokens: 1000,
-    system: systemPrompt,
-    messages: [{ role: 'user', content: userContent }],
-    mcp_servers: [{ type: 'url', url: CLICKUP_MCP_URL, name: 'clickup' }],
+    system:     systemPrompt,
+    messages:   [{ role: 'user', content: userContent }],
+    mcp_servers: [{
+      type:                'url',
+      url:                 CLICKUP_MCP_URL,
+      name:                'clickup',
+      authorization_token: process.env.CLICKUP_MCP_TOKEN,
+    }],
+    betas: [MCP_BETA],
   });
 
   const rawText = response.content
@@ -288,33 +296,40 @@ Search ClickUp for duplicates. If none found, create the ticket.`;
     console.error('Failed to parse Claude response:', rawText);
     return {
       isDuplicate: false,
-      confidence: 'low',
+      confidence:  'low',
       matchedTask: null,
       createdTask: null,
-      summary: 'Could not analyse results — please check ClickUp manually.',
+      summary:     'Could not analyse results — please check ClickUp manually.',
     };
   }
 }
 
-// Fallback: directly create a ClickUp task (used by "Create Anyway" button)
+// "Create Anyway" button — bypass dupe check, create directly via MCP
 async function createClickUpTicket(bug) {
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
+  const response = await anthropic.beta.messages.create({
+    model:      'claude-sonnet-4-20250514',
     max_tokens: 500,
-    system: 'You are a ClickUp assistant. Create the task as described and respond ONLY with a JSON object: { "url": "https://app.clickup.com/t/..." }. No prose, no markdown.',
-    messages: [{
-      role: 'user',
-      content: `Create a ClickUp bug task:
+    system:     'You are a ClickUp assistant. Create the task as described and respond ONLY with JSON: { "url": "https://app.clickup.com/t/..." }. No prose, no markdown.',
+    messages:   [{
+      role:    'user',
+      content: `Create a ClickUp bug task in the most appropriate active list:
 Title: ${bug.title}
 Priority: ${bug.priority || 'normal'}
 Description: ${bug.description}
-${bug.steps ? `Steps:\n${bug.steps}` : ''}`,
+${bug.steps ? `Steps:\n${bug.steps}` : ''}
+Reported by: ${bug.author}`,
     }],
-    mcp_servers: [{ type: 'url', url: CLICKUP_MCP_URL, name: 'clickup' }],
+    mcp_servers: [{
+      type:                'url',
+      url:                 CLICKUP_MCP_URL,
+      name:                'clickup',
+      authorization_token: process.env.CLICKUP_MCP_TOKEN,
+    }],
+    betas: [MCP_BETA],
   });
 
   const rawText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
-  const parsed = JSON.parse(rawText.replace(/```json|```/g, '').trim());
+  const parsed  = JSON.parse(rawText.replace(/```json|```/g, '').trim());
   return parsed.url;
 }
 
