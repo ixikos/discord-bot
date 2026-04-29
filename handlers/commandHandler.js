@@ -1,5 +1,9 @@
-const { REST, Routes, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+const { REST, Routes, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder, EmbedBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const messageHandler = require('./messageHandler');
+const Anthropic = require('@anthropic-ai/sdk');
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const CLICKUP_MCP_URL = 'https://mcp.clickup.com/mcp';
 
 // ---------------------------------------------------------------------------
 // Define slash commands here — add new ones to this array
@@ -126,14 +130,16 @@ async function handle(interaction, client) {
         priority:    interaction.fields.getTextInputValue('priority') || 'normal',
         author:      interaction.user.username,
         timestamp:   new Date().toISOString(),
-        immediate:   true,
       };
 
       try {
-        await forwardBugsToN8n([bug], true);
-        await interaction.editReply('✅ Bug filed — ClickUp ticket being created now.');
+        const result = await checkDuplicateAndCreate(bug);
+        const embed  = buildResultEmbed(bug, result, interaction.user);
+        const components = result.isDuplicate ? buildDuplicateButtons(bug, result) : [];
+        await interaction.editReply({ embeds: [embed], components });
       } catch (err) {
-        await interaction.editReply(`❌ Failed to create ticket: ${err.message}`);
+        console.error('Bug modal error:', err);
+        await interaction.editReply(`❌ Failed to process bug report: ${err.message}`);
       }
     }
   }
@@ -183,20 +189,190 @@ async function handle(interaction, client) {
       version,
       author:    interaction.user.username,
       timestamp: new Date().toISOString(),
-      immediate: true,
     };
 
     try {
-      await forwardBugsToN8n([bug], true);
-      await interaction.editReply('✅ Bug filed against this build.');
+      const result = await checkDuplicateAndCreate(bug);
+      const embed  = buildResultEmbed(bug, result, interaction.user);
+      const components = result.isDuplicate ? buildDuplicateButtons(bug, result) : [];
+      await interaction.editReply({ embeds: [embed], components });
     } catch (err) {
+      console.error('Build bug modal error:', err);
       await interaction.editReply(`❌ Failed: ${err.message}`);
+    }
+  }
+  // Button: "Create Anyway" after a duplicate was flagged
+  if (interaction.isButton() && interaction.customId.startsWith('create_anyway:')) {
+    await interaction.deferUpdate();
+    const bugJson = Buffer.from(interaction.customId.split('create_anyway:')[1], 'base64').toString('utf8');
+    const bug = JSON.parse(bugJson);
+
+    try {
+      const ticketUrl = await createClickUpTicket(bug);
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x57F287)
+            .setTitle('✅ Ticket Created')
+            .setDescription(`New ClickUp ticket filed despite possible duplicate.\n[View Ticket](${ticketUrl})`)
+            .setTimestamp(),
+        ],
+        components: [],
+      });
+    } catch (err) {
+      await interaction.editReply({ content: `❌ Failed to create ticket: ${err.message}`, components: [] });
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Send bugs to n8n webhook for LLM processing + ClickUp ticket creation
+// Claude + ClickUp MCP: check for duplicates, create ticket if none found
+// ---------------------------------------------------------------------------
+async function checkDuplicateAndCreate(bug) {
+  const systemPrompt = `You are a bug-triage assistant integrated with ClickUp for a game called Skydew Islands.
+
+Your job:
+1. Search ClickUp using 2-3 different focused keyword queries (2-3 words each) to find tasks similar to the bug report.
+2. Decide if a duplicate exists.
+3. If NO duplicate: create a new ClickUp task for this bug in the appropriate list.
+4. Respond ONLY with a JSON object — no prose, no markdown fences:
+
+{
+  "isDuplicate": true | false,
+  "confidence": "high" | "medium" | "low",
+  "matchedTask": {
+    "id": "task_id",
+    "name": "task name",
+    "url": "https://app.clickup.com/t/...",
+    "status": "status string",
+    "similarity": "one sentence why this matches"
+  } | null,
+  "createdTask": {
+    "url": "https://app.clickup.com/t/..."
+  } | null,
+  "summary": "2-3 sentence analysis of what you found and what action was taken"
+}
+
+Rules:
+- isDuplicate=true only when confidence is medium or high.
+- If isDuplicate=true, do NOT create a new task. Set createdTask=null.
+- If isDuplicate=false, CREATE the task and populate createdTask.url.
+- When creating, use the bug's priority field and include steps in the task description if provided.`;
+
+  const userContent = `Bug report:
+Title: ${bug.title}
+Priority: ${bug.priority || 'normal'}
+Author: ${bug.author}
+${bug.version ? `Build: ${bug.version}` : ''}
+Description: ${bug.description}
+${bug.steps ? `Steps to Reproduce:\n${bug.steps}` : ''}
+
+Search ClickUp for duplicates. If none found, create the ticket.`;
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1000,
+    system: systemPrompt,
+    messages: [{ role: 'user', content: userContent }],
+    mcp_servers: [{ type: 'url', url: CLICKUP_MCP_URL, name: 'clickup' }],
+  });
+
+  const rawText = response.content
+    .filter(b => b.type === 'text')
+    .map(b => b.text)
+    .join('');
+
+  try {
+    return JSON.parse(rawText.replace(/```json|```/g, '').trim());
+  } catch {
+    console.error('Failed to parse Claude response:', rawText);
+    return {
+      isDuplicate: false,
+      confidence: 'low',
+      matchedTask: null,
+      createdTask: null,
+      summary: 'Could not analyse results — please check ClickUp manually.',
+    };
+  }
+}
+
+// Fallback: directly create a ClickUp task (used by "Create Anyway" button)
+async function createClickUpTicket(bug) {
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 500,
+    system: 'You are a ClickUp assistant. Create the task as described and respond ONLY with a JSON object: { "url": "https://app.clickup.com/t/..." }. No prose, no markdown.',
+    messages: [{
+      role: 'user',
+      content: `Create a ClickUp bug task:
+Title: ${bug.title}
+Priority: ${bug.priority || 'normal'}
+Description: ${bug.description}
+${bug.steps ? `Steps:\n${bug.steps}` : ''}`,
+    }],
+    mcp_servers: [{ type: 'url', url: CLICKUP_MCP_URL, name: 'clickup' }],
+  });
+
+  const rawText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+  const parsed = JSON.parse(rawText.replace(/```json|```/g, '').trim());
+  return parsed.url;
+}
+
+// ---------------------------------------------------------------------------
+// Embed + button builders
+// ---------------------------------------------------------------------------
+function buildResultEmbed(bug, result, user) {
+  const priorityEmoji = { urgent: '🔴', high: '🟠', normal: '🟡', low: '🟢' }[bug.priority] ?? '⚪';
+
+  if (result.isDuplicate && result.matchedTask) {
+    const confidenceEmoji = { high: '🎯', medium: '🔍', low: '🤔' }[result.confidence] ?? '🔍';
+    return new EmbedBuilder()
+      .setColor(0xE74C3C)
+      .setTitle('⚠️ Possible Duplicate Bug')
+      .setDescription(`**Analysis:** ${result.summary}`)
+      .addFields(
+        { name: `${priorityEmoji} Your Report`, value: `**${bug.title}**\n${bug.description.slice(0, 200)}${bug.description.length > 200 ? '…' : ''}` },
+        {
+          name: `${confidenceEmoji} Existing Ticket (${result.confidence} confidence)`,
+          value: `**[${result.matchedTask.name}](${result.matchedTask.url})**\nStatus: \`${result.matchedTask.status}\`\n${result.matchedTask.similarity}`,
+        },
+      )
+      .setFooter({ text: 'This is only visible to you — use the buttons below' })
+      .setTimestamp();
+  }
+
+  return new EmbedBuilder()
+    .setColor(0x57F287)
+    .setTitle('✅ Bug Ticket Created')
+    .setDescription(`**Analysis:** ${result.summary}`)
+    .addFields(
+      { name: `${priorityEmoji} Bug`, value: `**${bug.title}**` },
+      { name: 'ClickUp', value: result.createdTask?.url ? `[View Ticket](${result.createdTask.url})` : 'Created (URL unavailable)', inline: true },
+      { name: 'Priority', value: `${priorityEmoji} ${bug.priority || 'normal'}`, inline: true },
+    )
+    .setTimestamp();
+}
+
+function buildDuplicateButtons(bug, result) {
+  // Encode the bug as base64 so we can recover it in the button handler
+  const bugEncoded = Buffer.from(JSON.stringify(bug)).toString('base64');
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setLabel('View Existing Ticket')
+      .setStyle(ButtonStyle.Link)
+      .setURL(result.matchedTask.url)
+      .setEmoji('🔗'),
+    new ButtonBuilder()
+      .setCustomId(`create_anyway:${bugEncoded}`)
+      .setLabel('Create Anyway')
+      .setStyle(ButtonStyle.Secondary)
+      .setEmoji('🆕'),
+  );
+  return [row];
+}
+
+// ---------------------------------------------------------------------------
+// Legacy n8n forwarder — kept for flush-bugs EOD batch
 // ---------------------------------------------------------------------------
 async function forwardBugsToN8n(bugs, immediate = false) {
   const url = immediate
@@ -211,9 +387,7 @@ async function forwardBugsToN8n(bugs, immediate = false) {
     body:    JSON.stringify({ bugs }),
   });
 
-  if (!res.ok) {
-    throw new Error(`n8n responded with ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`n8n responded with ${res.status}`);
 }
 
 module.exports = { register, handle };
