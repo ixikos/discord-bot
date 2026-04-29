@@ -276,7 +276,7 @@ ${bug.steps ? `Steps to Reproduce:\n${bug.steps}` : ''}
 Search ClickUp for duplicates across the whole workspace. If none found, create the ticket.`;
 
   const response = await anthropic.beta.messages.create({
-    model:      'claude-sonnet-4-20250514',
+    model:      'claude-sonnet-4-6',
     max_tokens: 1000,
     system:     systemPrompt,
     messages:   [{ role: 'user', content: userContent }],
@@ -312,7 +312,7 @@ Search ClickUp for duplicates across the whole workspace. If none found, create 
 // "Create Anyway" button — bypass dupe check, create directly via MCP
 async function createClickUpTicket(bug) {
   const response = await anthropic.beta.messages.create({
-    model:      'claude-sonnet-4-20250514',
+    model:      'claude-sonnet-4-6',
     max_tokens: 500,
     system:     'You are a ClickUp assistant. Create the task as described and respond ONLY with JSON: { "url": "https://app.clickup.com/t/..." }. No prose, no markdown.',
     messages:   [{
