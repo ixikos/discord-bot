@@ -519,10 +519,11 @@ async function handle(interaction, client) {
     const stored  = retrieveBug(taskRef);
     const bug     = stored?.bug ?? null;
 
-    // Truncate to Discord's 4000 char max for placeholder, 1024 for setValue
-    const descPlaceholder  = bug?.description ? bug.description.slice(0, 990) + (bug.description.length > 990 ? '…' : '') : 'Any extra context, environment details, frequency...';
-    const stepsPlaceholder = bug?.steps        ? bug.steps.slice(0, 990)                                                   : '1. Open inventory\n2. Move item\n3. Observe blank slot';
-    const currentPriority  = bug?.priority     ? bug.priority                                                              : 'normal';
+    // Discord caps placeholders at 100 chars
+    const trunc = (s, n = 97) => s.length > n ? s.slice(0, n) + '…' : s;
+    const descPlaceholder  = bug?.description ? trunc(bug.description) : 'Any extra context, environment details, frequency...';
+    const stepsPlaceholder = bug?.steps        ? trunc(bug.steps)       : '1. Open inventory  2. Move item  3. Observe blank slot';
+    const currentPriority  = bug?.priority     ? bug.priority           : 'normal';
 
     const modal = new ModalBuilder()
       .setCustomId(`detail_modal:${taskRef}`)
