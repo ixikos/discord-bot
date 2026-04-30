@@ -5,27 +5,29 @@ const Anthropic = require('@anthropic-ai/sdk');
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ---------------------------------------------------------------------------
-// Pending image upload store — maps a user+channel key to a ClickUp task ID.
-// When the bot asks a user to upload images, it watches for their next message.
+// Pending action stores — map a user+channel key to a pending ClickUp action.
+// When the bot asks a user to reply with content, it watches for their next message.
 // ---------------------------------------------------------------------------
 const _pendingImages = new Map();
 const PENDING_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-function setPendingImage(userId, channelId, taskId) {
-  _pendingImages.set(`${userId}:${channelId}`, { taskId, expires: Date.now() + PENDING_TTL_MS });
+function setPending(store, userId, channelId, value) {
+  store.set(`${userId}:${channelId}`, { value, expires: Date.now() + PENDING_TTL_MS });
 }
-
-function getPendingImage(userId, channelId) {
-  const key = `${userId}:${channelId}`;
-  const entry = _pendingImages.get(key);
+function getPending(store, userId, channelId) {
+  const entry = store.get(`${userId}:${channelId}`);
   if (!entry) return null;
-  if (Date.now() > entry.expires) { _pendingImages.delete(key); return null; }
-  return entry.taskId;
+  if (Date.now() > entry.expires) { store.delete(`${userId}:${channelId}`); return null; }
+  return entry.value;
+}
+function clearPending(store, userId, channelId) {
+  store.delete(`${userId}:${channelId}`);
 }
 
-function clearPendingImage(userId, channelId) {
-  _pendingImages.delete(`${userId}:${channelId}`);
-}
+const setPendingImage   = (userId, channelId, taskId) => setPending(_pendingImages,  userId, channelId, taskId);
+const getPendingImage   = (userId, channelId)         => getPending(_pendingImages,  userId, channelId);
+const clearPendingImage = (userId, channelId)         => clearPending(_pendingImages, userId, channelId);
+
 
 // ---------------------------------------------------------------------------
 // In-memory bug store — avoids Discord's 100-char customId limit.
@@ -63,10 +65,33 @@ function clickupAuthHeader() {
 
 // ---------------------------------------------------------------------------
 // Workspace list cache — fetched on startup, refreshed every hour or on demand
+// Falls back to a hardcoded snapshot if the REST API rejects the personal token
+// (ClickUp's /space endpoint requires admin/owner workspace permissions).
 // ---------------------------------------------------------------------------
 let _listCache = [];
 let _listCacheTime = 0;
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+// Fallback snapshot of meaningful lists in the Skydew Islands workspace.
+// Used when the dynamic fetch fails (e.g. token lacks /space read permission).
+// Update via /refresh-lists if workspace structure changes significantly.
+const FALLBACK_LISTS = [
+  { id: '901113636608', name: 'Bugs',                              folder: 'Epics',           space: 'Skydew Islands' },
+  { id: '901113636505', name: '4/19 - 5/3 (Active Sprint)',        folder: 'Sprints',         space: 'Skydew Islands' },
+  { id: '901113604581', name: 'Catchall',                          folder: 'Epics',           space: 'Skydew Islands' },
+  { id: '901112286095', name: 'Inventory / Chests / Collectibles', folder: 'Epics',           space: 'Skydew Islands' },
+  { id: '901113636599', name: 'Player Movement and Interaction',   folder: 'Epics',           space: 'Skydew Islands' },
+  { id: '901113636661', name: 'UI',                                folder: 'Epics',           space: 'Skydew Islands' },
+  { id: '901113636658', name: 'Client Networking',                 folder: 'Epics',           space: 'Skydew Islands' },
+  { id: '901112260707', name: 'Gameplay Loops',                    folder: 'Epics',           space: 'Skydew Islands' },
+  { id: '901111865228', name: 'Base Building Epic',                folder: 'Epics',           space: 'Skydew Islands' },
+  { id: '901112531922', name: 'Mutators',                          folder: 'Epics',           space: 'Skydew Islands' },
+  { id: '901113027450', name: 'Beacon Quests',                     folder: 'Epics',           space: 'Skydew Islands' },
+  { id: '901106528870', name: 'Movement',                          folder: 'Core Systems',    space: 'Skydew Islands' },
+  { id: '901106458516', name: 'Validity',                          folder: 'Core Systems',    space: 'Skydew Islands' },
+  { id: '901113682512', name: 'Spreadsheet Import',                folder: 'Skydew Islands',  space: 'Skydew Islands' },
+  { id: '901113636653', name: 'Editor Tooling and QoL',            folder: 'Epics',           space: 'Skydew Islands' },
+];
 
 async function getWorkspaceLists(force = false) {
   if (!force && _listCache.length > 0 && Date.now() - _listCacheTime < CACHE_TTL_MS) {
@@ -77,7 +102,6 @@ async function getWorkspaceLists(force = false) {
   const lists = [];
 
   try {
-    // Fetch all spaces
     const spacesRes = await fetch(
       `${CLICKUP_API}/team/${process.env.CLICKUP_WORKSPACE_ID}/space?archived=false`,
       { headers: { Authorization: clickupAuthHeader() } }
@@ -86,7 +110,6 @@ async function getWorkspaceLists(force = false) {
     const { spaces } = await spacesRes.json();
 
     for (const space of spaces) {
-      // Folderless lists in this space
       const flRes = await fetch(
         `${CLICKUP_API}/space/${space.id}/list?archived=false`,
         { headers: { Authorization: clickupAuthHeader() } }
@@ -98,7 +121,6 @@ async function getWorkspaceLists(force = false) {
         }
       }
 
-      // Folders → lists
       const fRes = await fetch(
         `${CLICKUP_API}/space/${space.id}/folder?archived=false`,
         { headers: { Authorization: clickupAuthHeader() } }
@@ -107,7 +129,6 @@ async function getWorkspaceLists(force = false) {
       const { folders } = await fRes.json();
 
       for (const folder of (folders || [])) {
-        // Skip noisy archive/historical folders
         if (EXCLUDED_FOLDERS.some(ex => folder.name.toLowerCase().includes(ex))) continue;
 
         const lRes = await fetch(
@@ -124,17 +145,23 @@ async function getWorkspaceLists(force = false) {
 
     _listCache = lists;
     _listCacheTime = Date.now();
-    console.log(`✅ Cached ${lists.length} ClickUp lists`);
+    console.log(`✅ Cached ${lists.length} ClickUp lists from REST API`);
+    return _listCache;
   } catch (err) {
-    console.error('Failed to fetch workspace lists:', err.message);
-    // Return stale cache if available, otherwise empty
+    console.warn(`⚠️  Dynamic list fetch failed (${err.message}) — falling back to hardcoded snapshot. Token likely lacks /space read permission.`);
+
+    // If we have a stale cache from a previous successful fetch, prefer that
     if (_listCache.length > 0) {
-      console.warn('Using stale list cache');
+      console.warn('Using stale dynamic cache');
       return _listCache;
     }
-  }
 
-  return _listCache;
+    // Otherwise use the hardcoded fallback
+    _listCache = FALLBACK_LISTS;
+    _listCacheTime = Date.now();
+    console.log(`✅ Using fallback snapshot of ${_listCache.length} lists`);
+    return _listCache;
+  }
 }
 
 // clickupSearch is no longer used — search now goes through Claude+MCP in checkDuplicate
@@ -421,30 +448,6 @@ async function handle(interaction, client) {
     }
   }
 
-  // "Add Details" modal submission — update the ClickUp ticket
-  if (interaction.isModalSubmit() && interaction.customId.startsWith('detail_modal:')) {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const taskRef = interaction.customId.split('detail_modal:')[1];
-    const stored = retrieveBug(taskRef);
-    if (!stored) return interaction.editReply('❌ Session expired — ticket may still exist, check ClickUp directly.');
-
-    const { taskId } = stored;
-    const extraDescription = interaction.fields.getTextInputValue('extra_description');
-    const steps            = interaction.fields.getTextInputValue('steps');
-    const severity         = interaction.fields.getTextInputValue('severity') || null;
-
-    if (!extraDescription && !steps && !severity) {
-      return interaction.editReply('Nothing to update — all fields were empty.');
-    }
-
-    try {
-      await clickupUpdateTask(taskId, { extraDescription, steps, severity });
-      await interaction.editReply(`✅ Ticket updated! [View in ClickUp](https://app.clickup.com/t/${taskId})`);
-    } catch (err) {
-      await interaction.editReply(`❌ Failed to update ticket: ${err.message}`);
-    }
-  }
-
   // Modal from build bug button
   if (interaction.isModalSubmit() && interaction.customId.startsWith('bug_modal_build:')) {
     const [, buildId, version] = interaction.customId.split(':');
@@ -534,46 +537,24 @@ async function handle(interaction, client) {
 
   // "Add Details" button — open modal to add extra info to the ticket
   if (interaction.isButton() && interaction.customId.startsWith('add_details:')) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const taskRef = interaction.customId.split('add_details:')[1];
     const stored  = retrieveBug(taskRef);
-    const bug     = stored?.bug ?? null;
+    if (!stored) return interaction.editReply('❌ Session expired — bug context no longer available.');
+    const { taskId, bug } = stored;
 
-    // Discord caps placeholders at 100 chars and Paragraph fields can't have setValue
-    const trunc = (s, n = 97) => s.length > n ? s.slice(0, n) + '…' : s;
-    const descPlaceholder  = bug?.description ? `Current: "${trunc(bug.description, 88)}"` : 'Add extra context, environment details, frequency...';
-    const stepsPlaceholder = bug?.steps        ? `Current: "${trunc(bug.steps, 88)}"`       : 'Steps to reproduce the issue, one per line';
-    const currentPriority  = bug?.priority     ? bug.priority                                : 'normal';
+    if (!bug?.description || bug.description.trim().length < 3) {
+      return interaction.editReply('❌ No original message content available to add.');
+    }
 
-    const modal = new ModalBuilder()
-      .setCustomId(`detail_modal:${taskRef}`)
-      .setTitle('Edit / Add Details');
-    modal.addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('extra_description')
-          .setLabel('Additional info (will be appended)')
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(false)
-          .setPlaceholder(descPlaceholder)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('steps')
-          .setLabel('Steps to reproduce (will be appended)')
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(false)
-          .setPlaceholder(stepsPlaceholder)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('severity')
-          .setLabel('Severity (low / normal / high / urgent)')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(false)
-          .setValue(currentPriority)
-      ),
-    );
-    return interaction.showModal(modal);
+    try {
+      const formatted = await formatDetailsWithClaude(bug.description);
+      await clickupAppendToDescription(taskId, formatted);
+      await interaction.editReply(`✅ Original report added to the ticket. [View in ClickUp](https://app.clickup.com/t/${taskId})`);
+    } catch (err) {
+      console.error('add_details error:', err);
+      await interaction.editReply(`❌ Failed to update ticket: ${err.message}`);
+    }
   }
 
   // "Add Images" button — prompt user to reply with screenshots
@@ -988,6 +969,52 @@ function inferTitle(content) {
   const firstSentence = content.split(/[.!?\n]/)[0].trim();
   if (firstSentence.length >= 10 && firstSentence.length <= 100) return firstSentence;
   return content.slice(0, 80).trim() + (content.length > 80 ? '…' : '');
+}
+
+// Run text through Claude → returns clean markdown to append to a ticket
+async function formatDetailsWithClaude(rawText) {
+  const response = await anthropic.messages.create({
+    model:      'claude-sonnet-4-6',
+    max_tokens: 800,
+    system: `You are a bug-report formatting assistant. The user is adding more context to an existing bug ticket.
+Take their freeform reply and rewrite it as clean markdown.
+
+Rules:
+- Extract any reproduction steps you can identify and put them under a "**Steps to Reproduce**" heading as a numbered list
+- Extract any environment/version/build info and put under "**Environment**" if present
+- Extract expected vs actual behavior into "**Expected**" / "**Actual**" if present
+- Anything else that's just additional context goes under "**Additional Context**"
+- Do NOT make up information that isn't in the user's text
+- If a section has no info, omit it entirely
+- Output ONLY the markdown, no preamble, no JSON wrapping, no code fences`,
+    messages: [{ role: 'user', content: rawText }],
+  });
+  return response.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+}
+
+// Append formatted markdown to a ClickUp task's description (preserves existing content)
+async function clickupAppendToDescription(taskId, markdown) {
+  // Fetch current description
+  const getRes = await fetch(`${CLICKUP_API}/task/${taskId}`, {
+    headers: { Authorization: clickupAuthHeader() },
+  });
+  if (!getRes.ok) {
+    const err = await getRes.text();
+    throw new Error(`ClickUp fetch failed ${getRes.status}: ${err}`);
+  }
+  const task = await getRes.json();
+  const existing = task.description || task.text_content || '';
+  const separator = existing.trim().length > 0 ? '\n\n---\n\n' : '';
+
+  const res = await fetch(`${CLICKUP_API}/task/${taskId}`, {
+    method:  'PUT',
+    headers: { Authorization: clickupAuthHeader(), 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ description: existing + separator + markdown }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`ClickUp update failed ${res.status}: ${err}`);
+  }
 }
 
 // ---------------------------------------------------------------------------

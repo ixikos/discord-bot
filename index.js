@@ -67,6 +67,8 @@ client.on('interactionCreate', async (interaction) => {
 
 client.on('messageCreate', async (message) => {
   console.log(`Message received in channel: ${message.channelId} | BUGS_CHANNEL_ID: ${process.env.BUGS_CHANNEL_ID}`);
+  // Watch for pending image uploads — user replying with screenshots
+  await commandHandler.handleImageUpload(message, client);
   await messageHandler.handle(message, client);
 });
 
