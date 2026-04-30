@@ -458,7 +458,7 @@ async function handle(interaction, client) {
   // Button: "Create Anyway" after a duplicate was flagged
   // "Create Anyway" after duplicate warning — show list picker instead of auto-creating
   if (interaction.isButton() && interaction.customId.startsWith('create_anyway:')) {
-    await interaction.deferUpdate();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const bugId = interaction.customId.split('create_anyway:')[1];
     const bug = retrieveBug(bugId);
     if (!bug) return interaction.editReply({ content: '❌ Bug report expired — please resubmit.', components: [] });
@@ -573,7 +573,13 @@ async function handle(interaction, client) {
 
   // "Other list…" — show paginated full list browser
   if (interaction.isButton() && interaction.customId.startsWith('browse_lists:')) {
-    await interaction.deferUpdate();
+    // Use deferReply if this is a fresh interaction (from create_anyway),
+    // otherwise update in place (already has an ephemeral reply)
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    } else {
+      await interaction.deferUpdate();
+    }
     const storeId = interaction.customId.split('browse_lists:')[1];
     const stored = retrieveBug(storeId);
     if (!stored) return interaction.editReply({ content: '❌ Session expired — please resubmit the bug.', components: [] });
