@@ -548,9 +548,16 @@ async function handle(interaction, client) {
     }
 
     try {
-      const formatted = await formatDetailsWithClaude(bug.description);
-      await clickupAppendToDescription(taskId, formatted);
-      await interaction.editReply(`✅ Original report added to the ticket. [View in ClickUp](https://app.clickup.com/t/${taskId})`);
+      const author = bug.author || 'unknown';
+      const ts = bug.timestamp ? new Date(bug.timestamp).toLocaleString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+      }) : new Date().toLocaleString();
+      const sourceLink = bug.sourceUrl ? `\n\n*Source: ${bug.sourceUrl}*` : '';
+      const block = `**${author} · ${ts}**\n\n${bug.description}${sourceLink}`;
+      console.log(`[add_details] taskId=${taskId} appending ${block.length} chars`);
+      await clickupAppendToDescription(taskId, block);
+      await interaction.editReply(`✅ Report added to the ticket. [View in ClickUp](https://app.clickup.com/t/${taskId})`);
     } catch (err) {
       console.error('add_details error:', err);
       await interaction.editReply(`❌ Failed to update ticket: ${err.message}`);
@@ -992,8 +999,8 @@ Rules:
   return response.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
 }
 
-// Append formatted markdown to a ClickUp task's description (preserves existing content)
-async function clickupAppendToDescription(taskId, markdown) {
+// Append text to a ClickUp task's description (preserves existing content)
+async function clickupAppendToDescription(taskId, text) {
   // Fetch current description
   const getRes = await fetch(`${CLICKUP_API}/task/${taskId}`, {
     headers: { Authorization: clickupAuthHeader() },
@@ -1005,16 +1012,21 @@ async function clickupAppendToDescription(taskId, markdown) {
   const task = await getRes.json();
   const existing = task.description || task.text_content || '';
   const separator = existing.trim().length > 0 ? '\n\n---\n\n' : '';
+  const newDescription = existing + separator + text;
+
+  console.log(`[clickupAppend] task=${taskId} existing=${existing.length}ch new=${text.length}ch total=${newDescription.length}ch`);
 
   const res = await fetch(`${CLICKUP_API}/task/${taskId}`, {
     method:  'PUT',
     headers: { Authorization: clickupAuthHeader(), 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ description: existing + separator + markdown }),
+    body:    JSON.stringify({ description: newDescription }),
   });
   if (!res.ok) {
     const err = await res.text();
+    console.error(`[clickupAppend] PUT failed ${res.status}: ${err}`);
     throw new Error(`ClickUp update failed ${res.status}: ${err}`);
   }
+  console.log(`[clickupAppend] task=${taskId} updated successfully`);
 }
 
 // ---------------------------------------------------------------------------
