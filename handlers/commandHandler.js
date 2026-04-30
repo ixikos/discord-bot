@@ -57,9 +57,8 @@ const EXCLUDED_FOLDERS = ['sprint archive', 'weeklys', 'archive', 'cleanup'];
 
 // Use OAuth token for MCP-quality search, personal API key fallback
 function clickupAuthHeader() {
-  return process.env.CLICKUP_OAUTH_TOKEN
-    ? `Bearer ${process.env.CLICKUP_OAUTH_TOKEN}`
-    : process.env.CLICKUP_API_KEY;
+  // Both pk_* personal tokens and OAuth tokens use raw value (no Bearer prefix) for ClickUp REST API
+  return process.env.CLICKUP_API_KEY || process.env.CLICKUP_OAUTH_TOKEN;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,12 +141,32 @@ async function getWorkspaceLists(force = false) {
 
 async function clickupUpdateTask(taskId, { extraDescription, steps, severity }) {
   const priorityMap = { urgent: 1, high: 2, normal: 3, low: 4 };
+
+  // Build the new content to append
+  const additions = [];
+  if (extraDescription) additions.push(extraDescription);
+  if (steps) additions.push(`\n**Additional Steps:**\n${steps}`);
+
   const body = {};
-  const parts = [];
-  if (extraDescription) parts.push(extraDescription);
-  if (steps) parts.push(`\n\nAdditional Steps:\n${steps}`);
-  if (parts.length) body.description = parts.join('');
+
+  if (additions.length > 0) {
+    // Fetch the current task to get the existing description, then append
+    const getRes = await fetch(`${CLICKUP_API}/task/${taskId}`, {
+      headers: { Authorization: clickupAuthHeader() },
+    });
+    if (!getRes.ok) {
+      const err = await getRes.text();
+      throw new Error(`ClickUp fetch failed ${getRes.status}: ${err}`);
+    }
+    const task = await getRes.json();
+    const existing = task.description || task.text_content || '';
+    const separator = existing.trim().length > 0 ? '\n\n---\n\n' : '';
+    body.description = existing + separator + additions.join('\n\n');
+  }
+
   if (severity && priorityMap[severity]) body.priority = priorityMap[severity];
+
+  if (Object.keys(body).length === 0) return; // Nothing to update
 
   const res = await fetch(`${CLICKUP_API}/task/${taskId}`, {
     method:  'PUT',
@@ -519,11 +538,11 @@ async function handle(interaction, client) {
     const stored  = retrieveBug(taskRef);
     const bug     = stored?.bug ?? null;
 
-    // Discord caps placeholders at 100 chars
+    // Discord caps placeholders at 100 chars and Paragraph fields can't have setValue
     const trunc = (s, n = 97) => s.length > n ? s.slice(0, n) + '…' : s;
-    const descPlaceholder  = bug?.description ? trunc(bug.description) : 'Any extra context, environment details, frequency...';
-    const stepsPlaceholder = bug?.steps        ? trunc(bug.steps)       : '1. Open inventory  2. Move item  3. Observe blank slot';
-    const currentPriority  = bug?.priority     ? bug.priority           : 'normal';
+    const descPlaceholder  = bug?.description ? `Current: "${trunc(bug.description, 88)}"` : 'Add extra context, environment details, frequency...';
+    const stepsPlaceholder = bug?.steps        ? `Current: "${trunc(bug.steps, 88)}"`       : 'Steps to reproduce the issue, one per line';
+    const currentPriority  = bug?.priority     ? bug.priority                                : 'normal';
 
     const modal = new ModalBuilder()
       .setCustomId(`detail_modal:${taskRef}`)
@@ -532,7 +551,7 @@ async function handle(interaction, client) {
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('extra_description')
-          .setLabel('Description (edit or append)')
+          .setLabel('Additional info (will be appended)')
           .setStyle(TextInputStyle.Paragraph)
           .setRequired(false)
           .setPlaceholder(descPlaceholder)
@@ -540,7 +559,7 @@ async function handle(interaction, client) {
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('steps')
-          .setLabel('Steps to Reproduce')
+          .setLabel('Steps to reproduce (will be appended)')
           .setStyle(TextInputStyle.Paragraph)
           .setRequired(false)
           .setPlaceholder(stepsPlaceholder)
