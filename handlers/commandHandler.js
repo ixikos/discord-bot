@@ -554,7 +554,19 @@ async function handle(interaction, client) {
         hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
       }) : new Date().toLocaleString();
       const sourceLink = bug.sourceUrl ? `\n\n*Source: ${bug.sourceUrl}*` : '';
-      const block = `**${author} · ${ts}**\n\n${bug.description}${sourceLink}`;
+
+      // Run the original message through Claude for a cleaner formatted version
+      let formattedSection = '';
+      try {
+        const formatted = await formatDetailsWithClaude(bug.description);
+        if (formatted && formatted.trim().length > 0) {
+          formattedSection = `\n\n**Formatted Report**\n\n${formatted}`;
+        }
+      } catch (formatErr) {
+        console.warn('[add_details] formatting failed, skipping:', formatErr.message);
+      }
+
+      const block = `**${author} · ${ts}**\n\n${bug.description}${sourceLink}${formattedSection}`;
       console.log(`[add_details] taskId=${taskId} appending ${block.length} chars`);
       await clickupAppendToDescription(taskId, block);
       await interaction.editReply(`✅ Report added to the ticket. [View in ClickUp](https://app.clickup.com/t/${taskId})`);
