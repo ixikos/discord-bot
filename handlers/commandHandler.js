@@ -63,6 +63,35 @@ function clickupAuthHeader() {
   return process.env.CLICKUP_API_KEY || process.env.CLICKUP_OAUTH_TOKEN;
 }
 
+// Wrapper around fetch() that retries on transient ClickUp errors (502/503/504/429).
+// ClickUp's gateway occasionally returns 502 Bad Gateway under load — usually clears in <2s.
+async function fetchWithRetry(url, options = {}, { maxAttempts = 3, baseDelayMs = 500 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      // Retry on transient server errors and rate limits
+      if ([429, 502, 503, 504].includes(res.status) && attempt < maxAttempts) {
+        const delay = baseDelayMs * Math.pow(2, attempt - 1);
+        console.warn(`[fetchWithRetry] ${url.split('/').slice(-2).join('/')} returned ${res.status}, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts) {
+        const delay = baseDelayMs * Math.pow(2, attempt - 1);
+        console.warn(`[fetchWithRetry] network error: ${err.message}, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+  if (lastErr) throw lastErr;
+  // Fallthrough — return final response (caller will handle non-2xx)
+  return fetch(url, options);
+}
+
 // ---------------------------------------------------------------------------
 // Workspace list cache — fetched on startup, refreshed every hour or on demand
 // Falls back to a hardcoded snapshot if the REST API rejects the personal token
@@ -195,7 +224,7 @@ async function clickupUpdateTask(taskId, { extraDescription, steps, severity }) 
 
   if (Object.keys(body).length === 0) return; // Nothing to update
 
-  const res = await fetch(`${CLICKUP_API}/task/${taskId}`, {
+  const res = await fetchWithRetry(`${CLICKUP_API}/task/${taskId}`, {
     method:  'PUT',
     headers: { Authorization: clickupAuthHeader(), 'Content-Type': 'application/json' },
     body:    JSON.stringify(body),
@@ -218,7 +247,7 @@ async function clickupAttachImage(taskId, imageUrl, filename) {
   form.append('attachment', new Blob([buffer]), filename);
   form.append('filename', filename);
 
-  const res = await fetch(`${CLICKUP_API}/task/${taskId}/attachment`, {
+  const res = await fetchWithRetry(`${CLICKUP_API}/task/${taskId}/attachment`, {
     method:  'POST',
     headers: { Authorization: clickupAuthHeader() },
     body:    form,
@@ -240,7 +269,7 @@ async function clickupCreateTask(bug, listId) {
     `\n\nReported by: ${bug.author}`,
   ].join('');
 
-  const res = await fetch(`${CLICKUP_API}/list/${listId}/task`, {
+  const res = await fetchWithRetry(`${CLICKUP_API}/list/${listId}/task`, {
     method:  'POST',
     headers: { Authorization: clickupAuthHeader(), 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -653,7 +682,7 @@ async function fetchAllTasksForSearch() {
   for (const listId of SEARCH_LIST_IDS) {
     let page = 0;
     while (true) {
-      const res = await fetch(
+      const res = await fetchWithRetry(
         `${CLICKUP_API}/list/${listId}/task?archived=false&subtasks=true&page=${page}`,
         { headers: { Authorization: clickupAuthHeader() } }
       );
@@ -1014,7 +1043,7 @@ Rules:
 // Append text to a ClickUp task's description (preserves existing content)
 async function clickupAppendToDescription(taskId, text) {
   // Fetch current description
-  const getRes = await fetch(`${CLICKUP_API}/task/${taskId}`, {
+  const getRes = await fetchWithRetry(`${CLICKUP_API}/task/${taskId}`, {
     headers: { Authorization: clickupAuthHeader() },
   });
   if (!getRes.ok) {
@@ -1028,7 +1057,7 @@ async function clickupAppendToDescription(taskId, text) {
 
   console.log(`[clickupAppend] task=${taskId} existing=${existing.length}ch new=${text.length}ch total=${newDescription.length}ch`);
 
-  const res = await fetch(`${CLICKUP_API}/task/${taskId}`, {
+  const res = await fetchWithRetry(`${CLICKUP_API}/task/${taskId}`, {
     method:  'PUT',
     headers: { Authorization: clickupAuthHeader(), 'Content-Type': 'application/json' },
     body:    JSON.stringify({ description: newDescription }),
