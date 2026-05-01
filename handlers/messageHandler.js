@@ -23,25 +23,12 @@ function clearBugs() {
 }
 
 async function handle(message, client) {
-  // Ignore bots
   if (message.author.bot) return;
-
-  // Only watch the bugs channel
   if (message.channelId !== process.env.BUGS_CHANNEL_ID) return;
 
-  // Store the message for EOD n8n batch processing
-  const bugs = loadBugs();
-  bugs.push({
-    id:        message.id,
-    author:    message.author.username,
-    content:   message.content,
-    timestamp: message.createdAt.toISOString(),
-    attachments: message.attachments.map(a => a.url),
-  });
-  saveBugs(bugs);
-
-  // React to acknowledge
-  await message.react('👀').catch(() => {});
+  // Auto-trigger the bug flow as if user reacted 🐛 to their own message
+  const commandHandler = require('./commandHandler');
+  await commandHandler.handleBugReaction(message, message.author, client);
 }
 
 module.exports = { handle, loadBugs, clearBugs };
